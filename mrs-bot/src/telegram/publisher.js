@@ -69,7 +69,7 @@ async function sendAlbum(items) {
   const media = items.map((item, index) => ({
     type: "photo",
     media: `attach://photo${index}`,
-    ...(index === 0 && item.caption ? { caption: item.caption } : {})
+    ...(item.caption ? { caption: item.caption } : {})
   }));
 
   form.append("media", JSON.stringify(media));
@@ -204,51 +204,83 @@ for (const [key, qty] of [["bulk_qty_10",10],["bulk_qty_25",25],["bulk_qty_50",5
 bot.on("text", async (ctx, next) => {
   if (ctx.chat?.type !== "private") return next();
 
-  const started = pendingSearches.get(ctx.chat.id);
+  const chatId = ctx.chat.id;
+  const bulk = pendingBulkSearches.get(chatId);
+
+  // IMPORTANT: Bulk mode must be checked before normal search mode.
+  // Otherwise a bulk query is silently passed to the next middleware.
+  if (bulk?.step === "query") {
+    pendingBulkSearches.delete(chatId);
+
+    if (Date.now() - bulk.started > SEARCH_TIMEOUT_MS) {
+      await ctx.reply("⌛ That bulk search request expired. Press 📦 Bulk Search & Post and try again.");
+      return;
+    }
+
+    const query = String(ctx.message.text || "").trim();
+
+    if (!query || query.startsWith("/")) {
+      await ctx.reply("❌ Please send a search word or phrase, for example: boy aesthetic pfp dark");
+      return;
+    }
+
+    pendingBulkSearches.set(chatId, {
+      step: "quantity",
+      query,
+      started: bulk.started
+    });
+
+    await ctx.reply(
+      `🔎 Exact search: ${query}\n\nHow many results should I bulk-post?`,
+      BULK_QTY_MENU
+    );
+    return;
+  }
+
+  const started = pendingSearches.get(chatId);
   if (!started) return next();
-  pendingSearches.delete(ctx.chat.id);
+
+  pendingSearches.delete(chatId);
 
   if (Date.now() - started > SEARCH_TIMEOUT_MS) {
     await ctx.reply("⌛ That search request expired. Press 🔎 Search & Post Now and try again.");
     return;
   }
 
-  const query = ctx.message.text.trim();
+  const query = String(ctx.message.text || "").trim();
+
   if (!query || query.startsWith("/")) {
     await ctx.reply("❌ Please send a search word or phrase, for example: pink wallpapers");
     return;
   }
 
-  // If this chat is in Bulk Search mode, save the exact query and ask for quantity.
-  const bulk = pendingBulkSearches.get(ctx.chat.id);
-  if (bulk?.step === "query") {
-    if (Date.now() - bulk.started > SEARCH_TIMEOUT_MS) {
-      pendingBulkSearches.delete(ctx.chat.id);
-      await ctx.reply("⌛ That bulk search request expired. Press 📦 Bulk Search & Post and try again.");
-      return;
-    }
-    bulk.query = query;
-    bulk.step = "quantity";
-    pendingBulkSearches.set(ctx.chat.id, bulk);
-    await ctx.reply(`🔎 Exact search: ${query}\n\nHow many results should I bulk-post?`, BULK_QTY_MENU);
-    return;
-  }
-
-  await ctx.reply(`🔎 Searching Pinterest for exactly: ${query}\n⏳ Preparing every valid result and posting to ${config.telegram.channelId}...`);
+  await ctx.reply(
+    `🔎 Searching Pinterest for exactly: ${query}\n⏳ Preparing every valid result and posting to ${config.telegram.channelId}...`
+  );
 
   try {
     const { runSearchPostJob } = await import("../worker.js");
     const result = await runSearchPostJob(query);
 
     if (!result.posted) {
-      await ctx.reply(`📭 No valid images were posted for: ${query}\n\nResults found: ${result.found || 0}`);
+      await ctx.reply(
+        `📭 No valid images were posted for: ${query}\n\nResults found: ${result.found || 0}`
+      );
       return;
     }
 
-    await ctx.reply(`✅ Search post complete!\n\n🔎 Query: ${query}\n📌 Results found: ${result.found}\n🖼️ Posted: ${result.posted}\n📢 Channel: ${config.telegram.channelId}`);
+    await ctx.reply(
+      `✅ Search post complete!\n\n🔎 Query: ${query}\n📌 Results found: ${result.found}\n🖼️ Posted: ${result.posted}\n📢 Channel: ${config.telegram.channelId}`
+    );
   } catch (error) {
-    logger.error({ error: error?.stack || error?.message, query }, "Search & Post failed");
-    await ctx.reply(`❌ Search & Post failed: ${error?.message?.slice(0, 300) || "Unknown error"}`);
+    logger.error(
+      { error: error?.stack || error?.message, query },
+      "Search & Post failed"
+    );
+
+    await ctx.reply(
+      `❌ Search & Post failed: ${error?.message?.slice(0, 300) || "Unknown error"}`
+    );
   }
 });
 

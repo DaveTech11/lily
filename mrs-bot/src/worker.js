@@ -72,35 +72,70 @@ async function prepareCandidate(candidate, category, query) {
 async function publishPrepared(prepared, category, query) {
   let posted = 0;
 
-  // Search & Post sends every valid result returned by Pinterest, one by one,
-  // so every image can have its own caption and no result is silently discarded.
-  for (const item of prepared) {
+  // Telegram supports up to 10 photos in one media group. Send search
+  // results as albums instead of one message per image.
+  const BATCH_SIZE = 10;
+
+  for (let start = 0; start < prepared.length; start += BATCH_SIZE) {
+    const batch = prepared.slice(start, start + BATCH_SIZE);
+
     try {
-      const result = await publish([item]);
-      const messageId = result?.message_id ? String(result.message_id) : null;
+      const results = await publish(batch);
+      const telegramResults = Array.isArray(results)
+        ? results
+        : (results ? [results] : []);
 
-      recordPost({
-        pinterestPinId: String(item.pin?.id || item.pin?.pin_id || item.pin?.pinId || item.pin?.pin_url || item.pin?.url || `manual-${item.imageHash}`),
-        imageHash: item.imageHash,
-        imageUrl: item.imageUrl,
-        sourceUrl: item.sourceUrl,
-        category,
-        query,
-        caption: item.caption,
-        telegramMessageId: messageId,
-        status: "posted"
-      });
+      for (let i = 0; i < batch.length; i++) {
+        const item = batch[i];
+        const telegramMessage = telegramResults[i];
+        const messageId = telegramMessage?.message_id
+          ? String(telegramMessage.message_id)
+          : null;
 
-      posted++;
-      await cleanupFiles(item.filePath, item.rawPath);
+        recordPost({
+          pinterestPinId: String(
+            item.pin?.id ||
+            item.pin?.pin_id ||
+            item.pin?.pinId ||
+            item.pin?.pin_url ||
+            item.pin?.url ||
+            `manual-${item.imageHash}`
+          ),
+          imageHash: item.imageHash,
+          imageUrl: item.imageUrl,
+          sourceUrl: item.sourceUrl,
+          category,
+          query,
+          caption: item.caption,
+          telegramMessageId: messageId,
+          status: "posted"
+        });
 
-      // Be gentle with Telegram when many images are returned.
-      if (prepared.length > 1) {
-        await new Promise(resolve => setTimeout(resolve, 1100));
+        posted++;
+      }
+
+      for (const item of batch) {
+        await cleanupFiles(item.filePath, item.rawPath);
+      }
+
+      logger.info(
+        { query, batchSize: batch.length, posted, total: prepared.length },
+        "Manual search album posted"
+      );
+
+      // Pause 1 minute between albums. Images inside an album arrive together.
+      if (start + BATCH_SIZE < prepared.length) {
+        await new Promise(resolve => setTimeout(resolve, 60000));
       }
     } catch (error) {
-      logger.warn({ error: error?.message, imageUrl: item.imageUrl, query }, "Manual search image failed; continuing");
-      await cleanupFiles(item.filePath, item.rawPath);
+      logger.warn(
+        { error: error?.message, query, batchSize: batch.length },
+        "Manual search album failed; continuing"
+      );
+
+      for (const item of batch) {
+        await cleanupFiles(item.filePath, item.rawPath);
+      }
     }
   }
 
