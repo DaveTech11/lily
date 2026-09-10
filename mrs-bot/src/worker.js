@@ -1,4 +1,5 @@
 import { getCandidates } from "./pinterest/search.js";
+import { searchPins } from "./pinterest/client.js";
 import { filterCandidates } from "./images/filter.js";
 import { downloadImage } from "./pinterest/downloader.js";
 import {
@@ -10,10 +11,7 @@ import {
 import { generateCaption } from "./captions/generator.js";
 import { publish } from "./telegram/publisher.js";
 import { config } from "./config.js";
-import {
-  hasImageHash,
-  recordPost
-} from "./database/database.js";
+import { hasImageHash, recordPost } from "./database/database.js";
 import { logger } from "./utils/logger.js";
 
 function selectDiverse(candidates, count) {
@@ -24,14 +22,11 @@ function selectDiverse(candidates, count) {
   for (const candidate of sorted) {
     const style = candidate.classification?.label || "other";
     if (seenStyles.has(style) && selected.length < count) continue;
-
     selected.push(candidate);
     seenStyles.add(style);
-
     if (selected.length >= count) break;
   }
 
-  // If diversity made the set too small, fill remaining slots.
   for (const candidate of sorted) {
     if (selected.includes(candidate)) continue;
     selected.push(candidate);
@@ -48,15 +43,11 @@ async function prepareCandidate(candidate, category, query) {
   try {
     const downloaded = await downloadImage(candidate.imageUrl);
     rawPath = downloaded.path;
-
     await inspectImage(rawPath);
-
     processedPath = await processImage(rawPath);
     const hash = await sha256(processedPath);
 
-    if (hasImageHash(hash)) {
-      return null;
-    }
+    if (hasImageHash(hash)) return null;
 
     return {
       ...candidate,
@@ -64,6 +55,7 @@ async function prepareCandidate(candidate, category, query) {
       query,
       imageHash: hash,
       filePath: processedPath,
+      rawPath,
       caption: generateCaption({
         category,
         classification: candidate.classification,
@@ -71,13 +63,48 @@ async function prepareCandidate(candidate, category, query) {
       })
     };
   } catch (error) {
-    logger.warn({
-      error: error.message,
-      imageUrl: candidate.imageUrl
-    }, "Candidate rejected during download/processing");
+    logger.warn({ error: error.message, imageUrl: candidate.imageUrl }, "Candidate rejected during download/processing");
     await cleanupFiles(rawPath, processedPath);
     return null;
   }
+}
+
+async function publishPrepared(prepared, category, query) {
+  let posted = 0;
+
+  // Search & Post sends every valid result returned by Pinterest, one by one,
+  // so every image can have its own caption and no result is silently discarded.
+  for (const item of prepared) {
+    try {
+      const result = await publish([item]);
+      const messageId = result?.message_id ? String(result.message_id) : null;
+
+      recordPost({
+        pinterestPinId: String(item.pin?.id || item.pin?.pin_id || item.pin?.pinId || item.pin?.pin_url || item.pin?.url || `manual-${item.imageHash}`),
+        imageHash: item.imageHash,
+        imageUrl: item.imageUrl,
+        sourceUrl: item.sourceUrl,
+        category,
+        query,
+        caption: item.caption,
+        telegramMessageId: messageId,
+        status: "posted"
+      });
+
+      posted++;
+      await cleanupFiles(item.filePath, item.rawPath);
+
+      // Be gentle with Telegram when many images are returned.
+      if (prepared.length > 1) {
+        await new Promise(resolve => setTimeout(resolve, 1100));
+      }
+    } catch (error) {
+      logger.warn({ error: error?.message, imageUrl: item.imageUrl, query }, "Manual search image failed; continuing");
+      await cleanupFiles(item.filePath, item.rawPath);
+    }
+  }
+
+  return posted;
 }
 
 export async function runHourlyJob() {
@@ -88,37 +115,30 @@ export async function runHourlyJob() {
 
     if (!items.length) {
       logger.warn({ category, query }, "Pinterest returned no candidates");
-      return;
+      return 0;
     }
 
     const candidates = filterCandidates(items, category);
-
     if (!candidates.length) {
       logger.warn({ category, query }, "No candidates passed filters");
-      return;
+      return 0;
     }
 
-    const selected = selectDiverse(
-      candidates,
-      config.content.imagesPerPost
-    );
-
+    const selected = selectDiverse(candidates, config.content.imagesPerPost);
     const prepared = [];
 
     for (const candidate of selected) {
       const item = await prepareCandidate(candidate, category, query);
       if (item) prepared.push(item);
-
       if (prepared.length >= config.content.imagesPerPost) break;
     }
 
     if (!prepared.length) {
       logger.warn({ category, query }, "No images survived processing");
-      return;
+      return 0;
     }
 
     const result = await publish(prepared);
-
     const messages = Array.isArray(result) ? result : [result];
 
     for (let i = 0; i < prepared.length; i++) {
@@ -130,28 +150,48 @@ export async function runHourlyJob() {
         category,
         query,
         caption: prepared[i].caption,
-        telegramMessageId: messages[i]?.message_id
-          ? String(messages[i].message_id)
-          : null,
+        telegramMessageId: messages[i]?.message_id ? String(messages[i].message_id) : null,
         status: "posted"
       });
     }
 
-    logger.info({
-      category,
-      query,
-      count: prepared.length,
-      elapsedMs: Date.now() - startedAt
-    }, "Hourly post completed");
+    await cleanupFiles(...prepared.flatMap(item => [item.filePath, item.rawPath]));
 
-    await cleanupFiles(...prepared.flatMap(item => [
-      item.filePath,
-      item.filePath?.replace("-processed.jpg", ".jpg")
-    ]));
+    logger.info({ category, query, count: prepared.length, elapsedMs: Date.now() - startedAt }, "Hourly post completed");
+    return prepared.length;
   } catch (error) {
-    logger.error({
-      error: error?.stack || error?.message || String(error),
-      elapsedMs: Date.now() - startedAt
-    }, "Hourly job failed; scheduler will continue");
+    logger.error({ error: error?.stack || error?.message || String(error), elapsedMs: Date.now() - startedAt }, "Hourly job failed; scheduler will continue");
+    return 0;
   }
+}
+
+export async function runSearchPostJob(exactQuery, onProgress = null, bulkLimit = 0) {
+  const query = String(exactQuery || "").trim();
+  if (!query) throw new Error("Search word cannot be empty");
+
+  const startedAt = Date.now();
+  logger.info({ query }, "Manual Pinterest search");
+
+  const items = await searchPins(query);
+  if (!items.length) return { query, found: 0, posted: 0 };
+
+  // Use a neutral category so the exact user query is preserved in the database.
+  const candidates = filterCandidates(items, "manual-search");
+  if (!candidates.length) return { query, found: items.length, accepted: 0, posted: 0 };
+
+  // Bulk mode can cap the number of results while preserving the exact search query.
+  const limit = Number.isFinite(Number(bulkLimit)) && Number(bulkLimit) > 0 ? Number(bulkLimit) : 0;
+  const candidatesToPrepare = limit ? candidates.slice(0, limit) : candidates;
+
+  const prepared = [];
+  for (let i = 0; i < candidatesToPrepare.length; i++) {
+    const item = await prepareCandidate(candidates[i], "manual-search", query);
+    if (item) prepared.push(item);
+    if (onProgress) await onProgress({ phase: "preparing", current: i + 1, total: candidatesToPrepare.length });
+  }
+
+  const posted = await publishPrepared(prepared, "manual-search", query);
+
+  logger.info({ query, found: items.length, accepted: candidates.length, prepared: prepared.length, posted, elapsedMs: Date.now() - startedAt }, "Manual search post completed");
+  return { query, found: items.length, accepted: candidatesToPrepare.length, prepared: prepared.length, posted };
 }

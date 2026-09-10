@@ -114,10 +114,143 @@ const MAIN_MENU = {
       [{ text: "📅 Schedule", callback_data: "info_schedule" }],
       [{ text: "📊 Stats", callback_data: "info_stats" }],
       [{ text: "📸 Next Post", callback_data: "info_next" }],
+      [{ text: "🔎 Search & Post Now", callback_data: "search_postnow" }],
+      [{ text: "📦 Bulk Search & Post", callback_data: "bulk_search_post" }],
       [{ text: "🚀 Post Now", callback_data: "trigger_postnow" }]
     ]
   }
 };
+
+// ── Search & Post Now ───────────────────────────────────────────
+// Stores one pending search per private chat. The next text message becomes
+// the exact Pinterest search query; no random query is substituted.
+const pendingSearches = new Map();
+const SEARCH_TIMEOUT_MS = 5 * 60 * 1000;
+const pendingBulkSearches = new Map();
+
+async function askForSearch(ctx) {
+  const chatId = ctx.chat?.id;
+  if (!chatId || ctx.chat?.type !== "private") return;
+
+  pendingSearches.set(chatId, Date.now());
+  await ctx.reply(
+    "🔎 Send the exact search word or phrase you want me to search on Pinterest.\n\nExample: pink wallpapers\n\nI will use exactly what you send and post every valid result I can retrieve, with captions.",
+    { reply_markup: { force_reply: true, selective: true } }
+  );
+}
+
+bot.action("search_postnow", async (ctx) => {
+  await ctx.answerCbQuery("Send your search word");
+  await askForSearch(ctx);
+});
+
+async function askForBulkSearch(ctx) {
+  const chatId = ctx.chat?.id;
+  if (!chatId || ctx.chat?.type !== "private") return;
+
+  pendingBulkSearches.set(chatId, { step: "query", started: Date.now() });
+  await ctx.reply(
+    "📦 Bulk Search & Post\n\nSend the exact Pinterest search word or phrase. I will search exactly what you send, then ask how many results you want posted.\n\nExample: anime wallpaper",
+    { reply_markup: { force_reply: true, selective: true } }
+  );
+}
+
+bot.action("bulk_search_post", async (ctx) => {
+  await ctx.answerCbQuery("Send your search word");
+  await askForBulkSearch(ctx);
+});
+
+const BULK_QTY_MENU = {
+  reply_markup: {
+    inline_keyboard: [
+      [{ text: "10 images", callback_data: "bulk_qty_10" }, { text: "25 images", callback_data: "bulk_qty_25" }],
+      [{ text: "50 images", callback_data: "bulk_qty_50" }, { text: "100 images", callback_data: "bulk_qty_100" }],
+      [{ text: "♾️ All available", callback_data: "bulk_qty_all" }]
+    ]
+  }
+};
+
+for (const [key, qty] of [["bulk_qty_10",10],["bulk_qty_25",25],["bulk_qty_50",50],["bulk_qty_100",100],["bulk_qty_all",0]]) {
+  bot.action(key, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const pending = pendingBulkSearches.get(chatId);
+    if (!pending || pending.step !== "quantity") {
+      await ctx.answerCbQuery("Start Bulk Search & Post first");
+      return;
+    }
+    pendingBulkSearches.delete(chatId);
+    if (Date.now() - pending.started > SEARCH_TIMEOUT_MS) {
+      await ctx.answerCbQuery("Request expired");
+      await ctx.reply("⌛ That bulk search request expired. Press 📦 Bulk Search & Post and try again.");
+      return;
+    }
+
+    await ctx.answerCbQuery(qty ? `Posting ${qty} images` : "Posting all available");
+    await ctx.reply(`📦 Bulk search started\n\n🔎 Exact query: ${pending.query}\n🖼️ Amount: ${qty || "all available"}\n⏳ Searching and posting...`);
+
+    try {
+      const { runSearchPostJob } = await import("../worker.js");
+      const result = await runSearchPostJob(pending.query, null, qty);
+      await ctx.reply(`✅ Bulk post complete!\n\n🔎 Query: ${result.query}\n📌 Results found: ${result.found}\n🖼️ Posted: ${result.posted}\n⏭️ Skipped/failed: ${Math.max(0, result.accepted - result.posted)}\n📢 Channel: ${config.telegram.channelId}`);
+    } catch (error) {
+      logger.error({ error: error?.stack || error?.message, query: pending.query, qty }, "Bulk Search & Post failed");
+      await ctx.reply(`❌ Bulk Search & Post failed: ${error?.message?.slice(0, 300) || "Unknown error"}`);
+    }
+  });
+}
+
+
+// Handle the search phrase after the button prompt.
+bot.on("text", async (ctx, next) => {
+  if (ctx.chat?.type !== "private") return next();
+
+  const started = pendingSearches.get(ctx.chat.id);
+  if (!started) return next();
+  pendingSearches.delete(ctx.chat.id);
+
+  if (Date.now() - started > SEARCH_TIMEOUT_MS) {
+    await ctx.reply("⌛ That search request expired. Press 🔎 Search & Post Now and try again.");
+    return;
+  }
+
+  const query = ctx.message.text.trim();
+  if (!query || query.startsWith("/")) {
+    await ctx.reply("❌ Please send a search word or phrase, for example: pink wallpapers");
+    return;
+  }
+
+  // If this chat is in Bulk Search mode, save the exact query and ask for quantity.
+  const bulk = pendingBulkSearches.get(ctx.chat.id);
+  if (bulk?.step === "query") {
+    if (Date.now() - bulk.started > SEARCH_TIMEOUT_MS) {
+      pendingBulkSearches.delete(ctx.chat.id);
+      await ctx.reply("⌛ That bulk search request expired. Press 📦 Bulk Search & Post and try again.");
+      return;
+    }
+    bulk.query = query;
+    bulk.step = "quantity";
+    pendingBulkSearches.set(ctx.chat.id, bulk);
+    await ctx.reply(`🔎 Exact search: ${query}\n\nHow many results should I bulk-post?`, BULK_QTY_MENU);
+    return;
+  }
+
+  await ctx.reply(`🔎 Searching Pinterest for exactly: ${query}\n⏳ Preparing every valid result and posting to ${config.telegram.channelId}...`);
+
+  try {
+    const { runSearchPostJob } = await import("../worker.js");
+    const result = await runSearchPostJob(query);
+
+    if (!result.posted) {
+      await ctx.reply(`📭 No valid images were posted for: ${query}\n\nResults found: ${result.found || 0}`);
+      return;
+    }
+
+    await ctx.reply(`✅ Search post complete!\n\n🔎 Query: ${query}\n📌 Results found: ${result.found}\n🖼️ Posted: ${result.posted}\n📢 Channel: ${config.telegram.channelId}`);
+  } catch (error) {
+    logger.error({ error: error?.stack || error?.message, query }, "Search & Post failed");
+    await ctx.reply(`❌ Search & Post failed: ${error?.message?.slice(0, 300) || "Unknown error"}`);
+  }
+});
 
 // ── Post Now ────────────────────────────────────────────────────
 
@@ -285,7 +418,8 @@ bot.action("info_next", async (ctx) => {
 // Catch-all for unknown commands
 bot.command("help", (ctx) => {
   ctx.reply(
-    `🤖 Available commands:\n\n/start — Show menu\n/postnow — Post immediately\n/stats — Bot stats\n/last — Most recent post\n/list — Last 5 posts\n/help — Show commands\n/ping — Health check`,
+    `🤖 Available commands:\n\n/start — Show menu\n/postnow — Post immediately\n/search — Search Pinterest and post results
+📦 Bulk Search & Post — Search and bulk-post 10/25/50/100/all results\n/stats — Bot stats\n/last — Most recent post\n/list — Last 5 posts\n/help — Show commands\n/ping — Health check`,
     MAIN_MENU
   );
 });
