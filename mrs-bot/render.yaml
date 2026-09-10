@@ -1,0 +1,32 @@
+services:
+  - type: worker
+    name: mrs-loner-lily-bot
+    runtime: node
+    # Render will use Node 20 (from package.json engines)
+    buildCommand: npm ci --omit=dev
+    startCommand: node src/main.js
+    autoDeploy: false
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHANNEL_ID
+        value: "@safespaceoriginal"
+      - key: PINTEREST_PROVIDER
+        value: rebix
+      - key: PINTEREST_ENDPOINT
+        value: https://api-rebix.zone.id/api/pinterest
+      - key: POST_INTERVAL
+        value: 3600
+      - key: IMAGES_PER_POST
+        value: 1
+      - key: SEARCH_RESULTS_PER_QUERY
+        value: 20
+      - key: REQUIRE_SOURCE_LINK
+        value: true
+      - key: RUN_ON_START
+        value: false
+      - key: LOG_LEVEL
+        value: info
+      # Add your PINTEREST_ACCESS_TOKEN if using official provider
+      # - key: PINTEREST_ACCESS_TOKEN
+      #   sync: false
