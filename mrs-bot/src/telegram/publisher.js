@@ -1,4 +1,5 @@
 import { Telegraf } from "telegraf";
+import fs from "node:fs";
 import { config } from "../config.js";
 import { withRetry } from "../utils/retry.js";
 import { logger } from "../utils/logger.js";
@@ -6,24 +7,80 @@ import { db, getState, hasImageHash, hasPinterestPin } from "../database/databas
 
 export const bot = new Telegraf(config.telegram.token);
 
-// ── Send helpers ────────────────────────────────────────────────
+// ── Telegram upload helpers ─────────────────────────────────────
+const TELEGRAM_TIMEOUT_MS = Number(process.env.TELEGRAM_TIMEOUT_MS || 60000);
+
+function telegramApiUrl(method) {
+  return `https://api.telegram.org/bot${config.telegram.token}/${method}`;
+}
+
+async function telegramRequest(method, form) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TELEGRAM_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(telegramApiUrl(method), {
+      method: "POST",
+      body: form,
+      signal: controller.signal
+    });
+
+    const text = await response.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { ok: false, description: text }; }
+
+    if (!response.ok || !data.ok) {
+      const error = new Error(data.description || `Telegram API HTTP ${response.status}`);
+      error.response = { statusCode: response.status, error_code: data.error_code };
+      throw error;
+    }
+
+    return data.result;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      const timeoutError = new Error(`Telegram ${method} timed out after ${TELEGRAM_TIMEOUT_MS}ms`);
+      timeoutError.code = "ETIMEDOUT";
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fileBlob(filePath) {
+  const buffer = await fs.promises.readFile(filePath);
+  return new Blob([buffer], { type: "image/jpeg" });
+}
 
 async function sendSingle(item) {
-  return bot.telegram.sendPhoto(
-    config.telegram.channelId,
-    { source: item.filePath },
-    { caption: item.caption, disable_notification: true }
-  );
+  const form = new FormData();
+  form.append("chat_id", String(config.telegram.channelId));
+  form.append("photo", await fileBlob(item.filePath), "image.jpg");
+  if (item.caption) form.append("caption", item.caption);
+  form.append("disable_notification", "true");
+  return telegramRequest("sendPhoto", form);
 }
 
 async function sendAlbum(items) {
+  const form = new FormData();
+  form.append("chat_id", String(config.telegram.channelId));
+
   const media = items.map((item, index) => ({
     type: "photo",
-    media: { source: item.filePath },
-    ...(index === 0 ? { caption: item.caption } : {})
+    media: `attach://photo${index}`,
+    ...(index === 0 && item.caption ? { caption: item.caption } : {})
   }));
-  return bot.telegram.sendMediaGroup(config.telegram.channelId, media);
+
+  form.append("media", JSON.stringify(media));
+
+  for (let i = 0; i < items.length; i++) {
+    form.append(`photo${i}`, await fileBlob(items[i].filePath), `image-${i}.jpg`);
+  }
+
+  return telegramRequest("sendMediaGroup", form);
 }
+
 
 // ── Public publish API ──────────────────────────────────────────
 
@@ -39,7 +96,7 @@ export async function publish(items) {
       retries: config.content.maxRetries,
       shouldRetry: error => {
         const status = error?.response?.error_code;
-        return !status || status === 429 || status >= 500;
+        return !status || status === 429 || status >= 500 || ["ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EPIPE"].includes(error?.code);
       },
       onRetry: async (error, attempt, delay) => {
         logger.warn({ attempt, delay, error: error?.message }, "Telegram upload retrying");

@@ -1,109 +1,129 @@
-﻿import Database from "better-sqlite3";
-import path from "path";
-import fs from "fs";
+import fs from "node:fs";
+import path from "node:path";
+import Database from "better-sqlite3";
+import { config } from "../config.js";
 
-const databasePath =
-  process.env.DATABASE_PATH ||
-  path.join(process.cwd(), "data", "lily.sqlite");
+const databasePath = config.storage.databasePath;
 
-const databaseDir = path.dirname(databasePath);
+fs.mkdirSync(path.dirname(databasePath), { recursive: true });
 
-if (!fs.existsSync(databaseDir)) {
-  fs.mkdirSync(databaseDir, { recursive: true });
-}
+export const db = new Database(databasePath);
 
-const db = new Database(databasePath);
-
+// Keep SQLite reliable on Render and other container hosts.
 db.pragma("journal_mode = WAL");
+db.pragma("busy_timeout = 5000");
 
 db.exec(`
-  CREATE TABLE IF NOT EXISTS posted_images (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    image_hash TEXT UNIQUE,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  );
-
   CREATE TABLE IF NOT EXISTS state (
     key TEXT PRIMARY KEY,
     value TEXT
   );
 
-  CREATE TABLE IF NOT EXISTS posted_pins (
+  CREATE TABLE IF NOT EXISTS posted_images (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    pin_id TEXT UNIQUE,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    pinterest_pin_id TEXT NOT NULL,
+    image_hash TEXT NOT NULL UNIQUE,
+    image_url TEXT,
+    source_url TEXT,
+    category TEXT,
+    query TEXT,
+    caption TEXT,
+    telegram_message_id TEXT,
+    status TEXT NOT NULL DEFAULT 'posted',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
+
+  CREATE INDEX IF NOT EXISTS idx_posted_images_created_at
+    ON posted_images(created_at);
+
+  CREATE INDEX IF NOT EXISTS idx_posted_images_pin_id
+    ON posted_images(pinterest_pin_id);
 `);
 
-export function getState(key, defaultValue = null) {
-  const row = db
-    .prepare("SELECT value FROM state WHERE key = ?")
-    .get(key);
+const getStateStmt = db.prepare(
+  "SELECT value FROM state WHERE key = ?"
+);
 
-  if (!row) return defaultValue;
+const setStateStmt = db.prepare(`
+  INSERT INTO state (key, value)
+  VALUES (?, ?)
+  ON CONFLICT(key) DO UPDATE SET value = excluded.value
+`);
 
-  try {
-    return JSON.parse(row.value);
-  } catch {
-    return row.value;
-  }
+const hasHashStmt = db.prepare(
+  "SELECT 1 FROM posted_images WHERE image_hash = ? LIMIT 1"
+);
+
+const hasPinStmt = db.prepare(
+  "SELECT 1 FROM posted_images WHERE pinterest_pin_id = ? LIMIT 1"
+);
+
+const insertPostStmt = db.prepare(`
+  INSERT INTO posted_images (
+    pinterest_pin_id,
+    image_hash,
+    image_url,
+    source_url,
+    category,
+    query,
+    caption,
+    telegram_message_id,
+    status
+  ) VALUES (
+    @pinterestPinId,
+    @imageHash,
+    @imageUrl,
+    @sourceUrl,
+    @category,
+    @query,
+    @caption,
+    @telegramMessageId,
+    @status
+  )
+`);
+
+export function getState(key) {
+  const row = getStateStmt.get(key);
+  return row?.value ?? null;
 }
 
 export function setState(key, value) {
-  const storedValue =
-    typeof value === "string" ? value : JSON.stringify(value);
-
-  db.prepare(`
-    INSERT INTO state (key, value)
-    VALUES (?, ?)
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-  `).run(key, storedValue);
+  setStateStmt.run(key, value == null ? null : String(value));
 }
 
 export function hasImageHash(imageHash) {
   if (!imageHash) return false;
-
-  return Boolean(
-    db
-      .prepare("SELECT 1 FROM posted_images WHERE image_hash = ? LIMIT 1")
-      .get(imageHash)
-  );
+  return Boolean(hasHashStmt.get(imageHash));
 }
 
-export function hasPinterestPin(pinId) {
-  if (!pinId) return false;
-
-  return Boolean(
-    db
-      .prepare("SELECT 1 FROM posted_pins WHERE pin_id = ? LIMIT 1")
-      .get(pinId)
-  );
+export function hasPinterestPin(pinterestPinId) {
+  if (!pinterestPinId) return false;
+  return Boolean(hasPinStmt.get(String(pinterestPinId)));
 }
 
-export function recordPost(data = {}) {
-  const imageHash = data.imageHash || data.hash || null;
-  const pinId = data.pinId || data.id || null;
-
-  if (imageHash) {
-    db.prepare(`
-      INSERT OR IGNORE INTO posted_images (image_hash)
-      VALUES (?)
-    `).run(imageHash);
+export function recordPost(post) {
+  if (!post || typeof post !== "object") {
+    throw new TypeError("recordPost requires a post object");
   }
 
-  if (pinId) {
-    db.prepare(`
-      INSERT OR IGNORE INTO posted_pins (pin_id)
-      VALUES (?)
-    `).run(String(pinId));
-  }
+  return insertPostStmt.run({
+    pinterestPinId: String(post.pinterestPinId ?? ""),
+    imageHash: String(post.imageHash ?? ""),
+    imageUrl: post.imageUrl ?? null,
+    sourceUrl: post.sourceUrl ?? null,
+    category: post.category ?? null,
+    query: post.query ?? null,
+    caption: post.caption ?? null,
+    telegramMessageId:
+      post.telegramMessageId == null ? null : String(post.telegramMessageId),
+    status: post.status ?? "posted"
+  });
 }
 
 export function closeDatabase() {
-  db.close();
+  try {
+    db.close();
+  } catch {
+    // Database may already be closed during shutdown.
+  }
 }
-
-export { db };
-export default db;
-
-

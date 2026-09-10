@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import http from "node:http";
 import { config } from "./config.js";
 import { logger } from "./utils/logger.js";
 import { startScheduler } from "./scheduler.js";
@@ -8,8 +9,24 @@ import { closeDatabase } from "./database/database.js";
 fs.mkdirSync(config.storage.downloadDir, { recursive: true });
 
 let scheduler;
+let healthServer;
 
 async function main() {
+  // Render Web Services require an open HTTP port. This tiny health server
+  // keeps the bot compatible with Render while Telegraf handles Telegram.
+  const port = Number(process.env.PORT || 10000);
+  healthServer = http.createServer((req, res) => {
+    if (req.url === "/api/health" || req.url === "/health") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, service: "mrs-loner-lily" }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+    res.end("MRS LONER LILY is running");
+  });
+  healthServer.listen(port, "0.0.0.0", () => {
+    logger.info({ port }, "Health server listening");
+  });
   logger.info("𓍢ִ໋🌷 𝐌𝐑𝐒 𝐋𝐎𝐍𝐄𝐑 ⟡ 𝐋𝐈𝐋𝐘 bot starting");
 
   // The bot does not need polling for publishing, but launching Telegraf
@@ -28,6 +45,10 @@ function shutdown(signal) {
 
   try {
     scheduler?.stop();
+  } catch {}
+
+  try {
+    healthServer?.close();
   } catch {}
 
   try {
