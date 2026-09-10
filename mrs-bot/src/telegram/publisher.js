@@ -105,18 +105,23 @@ export async function publish(items) {
   );
 }
 
-// ── Buttons ─────────────────────────────────────────────────────
+// ── Buttons / image menu ───────────────────────────────────────
+const MENU_IMAGE_URL = "https://i.ibb.co/G46CgB0F/photo-2026-09-10-14-12-20.jpg";
+
+const primary = (text, callback_data) => ({ text, callback_data, style: "primary" });
+const success = (text, callback_data) => ({ text, callback_data, style: "success" });
 
 const MAIN_MENU = {
   reply_markup: {
     inline_keyboard: [
-      [{ text: "📋 Channel", callback_data: "info_channel" }],
-      [{ text: "📅 Schedule", callback_data: "info_schedule" }],
-      [{ text: "📊 Stats", callback_data: "info_stats" }],
-      [{ text: "📸 Next Post", callback_data: "info_next" }],
-      [{ text: "🔎 Search & Post Now", callback_data: "search_postnow" }],
-      [{ text: "📦 Bulk Search & Post", callback_data: "bulk_search_post" }],
-      [{ text: "🚀 Post Now", callback_data: "trigger_postnow" }]
+      [primary("📋 Channel", "info_channel")],
+      [primary("📅 Schedule", "info_schedule")],
+      [primary("📊 Stats", "info_stats")],
+      [primary("📸 Next Post", "info_next")],
+      [success("🔎 Search & Post Now", "search_postnow")],
+      [success("📦 Bulk Search & Post", "bulk_search_post")],
+      [success("🚀 Post Now", "trigger_postnow")],
+      [primary("⏸️ Stop Current Task", "stop_task"), primary("▶️ Continue", "continue_task")]
     ]
   }
 };
@@ -163,9 +168,9 @@ bot.action("bulk_search_post", async (ctx) => {
 const BULK_QTY_MENU = {
   reply_markup: {
     inline_keyboard: [
-      [{ text: "10 images", callback_data: "bulk_qty_10" }, { text: "25 images", callback_data: "bulk_qty_25" }],
-      [{ text: "50 images", callback_data: "bulk_qty_50" }, { text: "100 images", callback_data: "bulk_qty_100" }],
-      [{ text: "♾️ All available", callback_data: "bulk_qty_all" }]
+      [{ text: "10 images", callback_data: "bulk_qty_10", style: "success" }, { text: "25 images", callback_data: "bulk_qty_25", style: "success" }],
+      [{ text: "50 images", callback_data: "bulk_qty_50", style: "success" }, { text: "100 images", callback_data: "bulk_qty_100", style: "success" }],
+      [{ text: "♾️ All available", callback_data: "bulk_qty_all", style: "success" }]
     ]
   }
 };
@@ -173,28 +178,45 @@ const BULK_QTY_MENU = {
 for (const [key, qty] of [["bulk_qty_10",10],["bulk_qty_25",25],["bulk_qty_50",50],["bulk_qty_100",100],["bulk_qty_all",0]]) {
   bot.action(key, async (ctx) => {
     const chatId = ctx.chat?.id;
-    const pending = pendingBulkSearches.get(chatId);
-    if (!pending || pending.step !== "quantity") {
-      await ctx.answerCbQuery("Start Bulk Search & Post first");
+    const bulk = pendingBulkSearches.get(chatId);
+    const normal = pendingSearches.get(chatId);
+    const pending = bulk?.step === "quantity" ? bulk : (normal?.step === "quantity" ? normal : null);
+    const isBulk = !!(bulk?.step === "quantity");
+
+    if (!pending) {
+      await ctx.answerCbQuery("Start a search first");
       return;
     }
-    pendingBulkSearches.delete(chatId);
+
+    if (isBulk) pendingBulkSearches.delete(chatId);
+    else pendingSearches.delete(chatId);
+
     if (Date.now() - pending.started > SEARCH_TIMEOUT_MS) {
       await ctx.answerCbQuery("Request expired");
-      await ctx.reply("⌛ That bulk search request expired. Press 📦 Bulk Search & Post and try again.");
+      await ctx.reply("⌛ That search request expired. Start the search again and try again.");
       return;
     }
 
     await ctx.answerCbQuery(qty ? `Posting ${qty} images` : "Posting all available");
-    await ctx.reply(`📦 Bulk search started\n\n🔎 Exact query: ${pending.query}\n🖼️ Amount: ${qty || "all available"}\n⏳ Searching and posting...`);
+    await ctx.reply(`${isBulk ? "📦 Bulk search started" : "🔎 Search started"}
+
+🔎 Exact query: ${pending.query}
+🖼️ Amount: ${qty || "all available"}
+⏳ Searching Pinterest and preparing your selected images...`);
 
     try {
       const { runSearchPostJob } = await import("../worker.js");
       const result = await runSearchPostJob(pending.query, null, qty);
-      await ctx.reply(`✅ Bulk post complete!\n\n🔎 Query: ${result.query}\n📌 Results found: ${result.found}\n🖼️ Posted: ${result.posted}\n⏭️ Skipped/failed: ${Math.max(0, result.accepted - result.posted)}\n📢 Channel: ${config.telegram.channelId}`);
+      await ctx.reply(`✅ ${isBulk ? "Bulk post" : "Search post"} complete!
+
+🔎 Query: ${result.query}
+📌 Results found: ${result.found}
+🖼️ Posted: ${result.posted}
+⏭️ Skipped/failed: ${Math.max(0, (result.accepted || 0) - result.posted)}
+📢 Channel: ${config.telegram.channelId}`);
     } catch (error) {
-      logger.error({ error: error?.stack || error?.message, query: pending.query, qty }, "Bulk Search & Post failed");
-      await ctx.reply(`❌ Bulk Search & Post failed: ${error?.message?.slice(0, 300) || "Unknown error"}`);
+      logger.error({ error: error?.stack || error?.message, query: pending.query, qty }, `${isBulk ? "Bulk Search & Post" : "Search & Post"} failed`);
+      await ctx.reply(`❌ ${isBulk ? "Bulk Search & Post" : "Search & Post"} failed: ${error?.message?.slice(0, 300) || "Unknown error"}`);
     }
   });
 }
@@ -240,9 +262,10 @@ bot.on("text", async (ctx, next) => {
   const started = pendingSearches.get(chatId);
   if (!started) return next();
 
+  // Normal Search & Post now also asks for the number of images before posting.
   pendingSearches.delete(chatId);
 
-  if (Date.now() - started > SEARCH_TIMEOUT_MS) {
+  if (Date.now() - (typeof started === "object" ? started.started : started) > SEARCH_TIMEOUT_MS) {
     await ctx.reply("⌛ That search request expired. Press 🔎 Search & Post Now and try again.");
     return;
   }
@@ -254,34 +277,70 @@ bot.on("text", async (ctx, next) => {
     return;
   }
 
+  pendingSearches.set(chatId, {
+    step: "quantity",
+    query,
+    started: typeof started === "object" ? started.started : started
+  });
+
   await ctx.reply(
-    `🔎 Searching Pinterest for exactly: ${query}\n⏳ Preparing every valid result and posting to ${config.telegram.channelId}...`
+    `🔎 Searching Pinterest for exactly: ${query}\n\n🖼️ How many images do you want me to send?`,
+    BULK_QTY_MENU
   );
+  return;
+});
 
+// ── Task controls ──────────────────────────────────────────────
+
+async function sendImageMenu(ctx) {
+  const caption = `🌷 MRS LONER ⟡ LILY\n\nChoose what you want to do:`;
+  return ctx.replyWithPhoto(MENU_IMAGE_URL, { caption, ...MAIN_MENU });
+}
+
+bot.command("menu", async (ctx) => {
+  if (ctx.chat?.type !== "private") return;
   try {
-    const { runSearchPostJob } = await import("../worker.js");
-    const result = await runSearchPostJob(query);
-
-    if (!result.posted) {
-      await ctx.reply(
-        `📭 No valid images were posted for: ${query}\n\nResults found: ${result.found || 0}`
-      );
-      return;
-    }
-
-    await ctx.reply(
-      `✅ Search post complete!\n\n🔎 Query: ${query}\n📌 Results found: ${result.found}\n🖼️ Posted: ${result.posted}\n📢 Channel: ${config.telegram.channelId}`
-    );
+    await sendImageMenu(ctx);
   } catch (error) {
-    logger.error(
-      { error: error?.stack || error?.message, query },
-      "Search & Post failed"
-    );
-
-    await ctx.reply(
-      `❌ Search & Post failed: ${error?.message?.slice(0, 300) || "Unknown error"}`
-    );
+    logger.warn({ error: error?.message }, "Menu image failed; sending text menu");
+    await ctx.reply("🌷 MRS LONER ⟡ LILY\n\nChoose what you want to do:", MAIN_MENU);
   }
+});
+
+bot.action("stop_task", async (ctx) => {
+  const { stopCurrentTask } = await import("../worker.js");
+  const stopped = stopCurrentTask();
+  await ctx.answerCbQuery(stopped ? "Task paused" : "No active task");
+  await ctx.reply(stopped ? "⏸️ Current task paused. Use /continue to resume it." : "ℹ️ There is no active task right now.");
+});
+
+bot.action("continue_task", async (ctx) => {
+  const { continueCurrentTask } = await import("../worker.js");
+  const continued = continueCurrentTask();
+  await ctx.answerCbQuery(continued ? "Task continued" : "No paused task");
+  await ctx.reply(continued ? "▶️ Current task continued." : "ℹ️ There is no paused task right now.");
+});
+
+bot.command("stop", async (ctx) => {
+  if (ctx.chat?.type !== "private") return;
+  const { stopCurrentTask } = await import("../worker.js");
+  const stopped = stopCurrentTask();
+  await ctx.reply(stopped ? "⏸️ Current task paused. Use /continue to resume." : "ℹ️ There is no active task right now.");
+});
+
+bot.command("continue", async (ctx) => {
+  if (ctx.chat?.type !== "private") return;
+  const { continueCurrentTask } = await import("../worker.js");
+  const continued = continueCurrentTask();
+  await ctx.reply(continued ? "▶️ Current task continued." : "ℹ️ There is no paused task right now.");
+});
+
+bot.command("task", async (ctx) => {
+  if (ctx.chat?.type !== "private") return;
+  const { getCurrentTask } = await import("../worker.js");
+  const task = getCurrentTask();
+  if (!task) return ctx.reply("ℹ️ No task is currently running.");
+  await ctx.reply(`📌 Current task: ${task.type}\n🔎 Query: ${task.query || "—"}\n${task.paused ? "⏸️ Status: paused" : "▶️ Status: running"}`);
 });
 
 // ── Post Now ────────────────────────────────────────────────────
@@ -325,11 +384,19 @@ function fmtDate(iso) {
 
 // ── Command handlers ────────────────────────────────────────────
 
-bot.start((ctx) => {
-  ctx.reply(
-    `👋 Welcome to MRS LONER ⟡ LILY\n\nI post curated content to ${config.telegram.channelId} every ${config.schedule.intervalSeconds / 60} minutes.\n\nPick an option below:`,
-    MAIN_MENU
-  );
+bot.start(async (ctx) => {
+  try {
+    await ctx.replyWithPhoto(MENU_IMAGE_URL, {
+      caption: `👋 Welcome to MRS LONER ⟡ LILY\n\nI post curated content to ${config.telegram.channelId} every ${config.schedule.intervalSeconds / 60} minutes.\n\nPick an option below:`,
+      ...MAIN_MENU
+    });
+  } catch (error) {
+    logger.warn({ error: error?.message }, "Start menu image failed; using text menu");
+    await ctx.reply(
+      `👋 Welcome to MRS LONER ⟡ LILY\n\nPick an option below:`,
+      MAIN_MENU
+    );
+  }
 });
 
 bot.command("ping", (ctx) => {
@@ -451,7 +518,7 @@ bot.action("info_next", async (ctx) => {
 bot.command("help", (ctx) => {
   ctx.reply(
     `🤖 Available commands:\n\n/start — Show menu\n/postnow — Post immediately\n/search — Search Pinterest and post results
-📦 Bulk Search & Post — Search and bulk-post 10/25/50/100/all results\n/stats — Bot stats\n/last — Most recent post\n/list — Last 5 posts\n/help — Show commands\n/ping — Health check`,
+📦 Bulk Search & Post — Search and bulk-post 10/25/50/100/all results\n/stats — Bot stats\n/last — Most recent post\n/list — Last 5 posts\n/help — Show commands\n/stop — Pause current task\n/continue — Resume paused task\n/task — Current task status\n/menu — Show image menu\n/ping — Health check`,
     MAIN_MENU
   );
 });

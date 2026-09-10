@@ -14,6 +14,53 @@ import { config } from "./config.js";
 import { hasImageHash, recordPost } from "./database/database.js";
 import { logger } from "./utils/logger.js";
 
+
+// ── Global task controls ───────────────────────────────────────
+let activeTask = null;
+
+function beginTask(type, query = null) {
+  if (activeTask) throw new Error(`A ${activeTask.type} task is already running.`);
+  activeTask = { type, query, paused: false, startedAt: Date.now() };
+}
+
+function finishTask() {
+  activeTask = null;
+}
+
+async function waitIfPaused() {
+  while (activeTask?.paused) {
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+}
+
+async function pauseAwareDelay(ms) {
+  let remaining = ms;
+  while (remaining > 0) {
+    await waitIfPaused();
+    const slice = Math.min(1000, remaining);
+    await new Promise(resolve => setTimeout(resolve, slice));
+    remaining -= slice;
+  }
+}
+
+export function stopCurrentTask() {
+  if (!activeTask) return false;
+  activeTask.paused = true;
+  logger.info({ type: activeTask.type, query: activeTask.query }, "Current task paused");
+  return true;
+}
+
+export function continueCurrentTask() {
+  if (!activeTask) return false;
+  activeTask.paused = false;
+  logger.info({ type: activeTask.type, query: activeTask.query }, "Current task continued");
+  return true;
+}
+
+export function getCurrentTask() {
+  return activeTask ? { ...activeTask } : null;
+}
+
 function selectDiverse(candidates, count) {
   const sorted = [...candidates].sort(() => Math.random() - 0.5);
   const selected = [];
@@ -77,6 +124,7 @@ async function publishPrepared(prepared, category, query) {
   const BATCH_SIZE = 10;
 
   for (let start = 0; start < prepared.length; start += BATCH_SIZE) {
+    await waitIfPaused();
     const batch = prepared.slice(start, start + BATCH_SIZE);
 
     try {
@@ -125,7 +173,7 @@ async function publishPrepared(prepared, category, query) {
 
       // Pause 1 minute between albums. Images inside an album arrive together.
       if (start + BATCH_SIZE < prepared.length) {
-        await new Promise(resolve => setTimeout(resolve, 60000));
+        await pauseAwareDelay(60000);
       }
     } catch (error) {
       logger.warn(
@@ -146,6 +194,8 @@ export async function runHourlyJob() {
   const startedAt = Date.now();
 
   try {
+    beginTask("scheduled-post");
+    await waitIfPaused();
     const { category, query, items } = await getCandidates();
 
     if (!items.length) {
@@ -163,6 +213,7 @@ export async function runHourlyJob() {
     const prepared = [];
 
     for (const candidate of selected) {
+      await waitIfPaused();
       const item = await prepareCandidate(candidate, category, query);
       if (item) prepared.push(item);
       if (prepared.length >= config.content.imagesPerPost) break;
@@ -173,6 +224,7 @@ export async function runHourlyJob() {
       return 0;
     }
 
+    await waitIfPaused();
     const result = await publish(prepared);
     const messages = Array.isArray(result) ? result : [result];
 
@@ -191,12 +243,13 @@ export async function runHourlyJob() {
     }
 
     await cleanupFiles(...prepared.flatMap(item => [item.filePath, item.rawPath]));
-
     logger.info({ category, query, count: prepared.length, elapsedMs: Date.now() - startedAt }, "Hourly post completed");
     return prepared.length;
   } catch (error) {
     logger.error({ error: error?.stack || error?.message || String(error), elapsedMs: Date.now() - startedAt }, "Hourly job failed; scheduler will continue");
     return 0;
+  } finally {
+    finishTask();
   }
 }
 
@@ -205,28 +258,35 @@ export async function runSearchPostJob(exactQuery, onProgress = null, bulkLimit 
   if (!query) throw new Error("Search word cannot be empty");
 
   const startedAt = Date.now();
-  logger.info({ query }, "Manual Pinterest search");
+  beginTask("search-post", query);
 
-  const items = await searchPins(query);
-  if (!items.length) return { query, found: 0, posted: 0 };
+  try {
+    logger.info({ query }, "Manual Pinterest search");
+    await waitIfPaused();
 
-  // Use a neutral category so the exact user query is preserved in the database.
-  const candidates = filterCandidates(items, "manual-search");
-  if (!candidates.length) return { query, found: items.length, accepted: 0, posted: 0 };
+    const items = await searchPins(query);
+    if (!items.length) return { query, found: 0, posted: 0 };
 
-  // Bulk mode can cap the number of results while preserving the exact search query.
-  const limit = Number.isFinite(Number(bulkLimit)) && Number(bulkLimit) > 0 ? Number(bulkLimit) : 0;
-  const candidatesToPrepare = limit ? candidates.slice(0, limit) : candidates;
+    const candidates = filterCandidates(items, "manual-search");
+    if (!candidates.length) return { query, found: items.length, accepted: 0, posted: 0 };
 
-  const prepared = [];
-  for (let i = 0; i < candidatesToPrepare.length; i++) {
-    const item = await prepareCandidate(candidates[i], "manual-search", query);
-    if (item) prepared.push(item);
-    if (onProgress) await onProgress({ phase: "preparing", current: i + 1, total: candidatesToPrepare.length });
+    const limit = Number.isFinite(Number(bulkLimit)) && Number(bulkLimit) > 0 ? Number(bulkLimit) : 0;
+    const candidatesToPrepare = limit ? candidates.slice(0, limit) : candidates;
+
+    const prepared = [];
+    for (let i = 0; i < candidatesToPrepare.length; i++) {
+      await waitIfPaused();
+      const item = await prepareCandidate(candidatesToPrepare[i], "manual-search", query);
+      if (item) prepared.push(item);
+      if (onProgress) await onProgress({ phase: "preparing", current: i + 1, total: candidatesToPrepare.length });
+    }
+
+    await waitIfPaused();
+    const posted = await publishPrepared(prepared, "manual-search", query);
+
+    logger.info({ query, found: items.length, accepted: candidatesToPrepare.length, prepared: prepared.length, posted, elapsedMs: Date.now() - startedAt }, "Manual search post completed");
+    return { query, found: items.length, accepted: candidatesToPrepare.length, prepared: prepared.length, posted };
+  } finally {
+    finishTask();
   }
-
-  const posted = await publishPrepared(prepared, "manual-search", query);
-
-  logger.info({ query, found: items.length, accepted: candidates.length, prepared: prepared.length, posted, elapsedMs: Date.now() - startedAt }, "Manual search post completed");
-  return { query, found: items.length, accepted: candidatesToPrepare.length, prepared: prepared.length, posted };
 }
