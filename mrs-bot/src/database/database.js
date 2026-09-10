@@ -103,4 +103,7 @@ export function closeDatabase() {
   db.close();
 }
 
+export { db };
 export default db;
+
+
