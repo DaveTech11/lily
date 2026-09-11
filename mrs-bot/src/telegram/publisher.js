@@ -3,9 +3,34 @@ import fs from "node:fs";
 import { config } from "../config.js";
 import { withRetry } from "../utils/retry.js";
 import { logger } from "../utils/logger.js";
-import { db, getState, hasImageHash, hasPinterestPin } from "../database/database.js";
+import { db, getState, hasImageHash, hasPinterestPin, recordPost, createScheduledPost, getNextScheduledPost } from "../database/database.js";
+import { QUERY_GROUPS, randomItem } from "../pinterest/queries.js";
+import { searchPins } from "../pinterest/client.js";
 
 export const bot = new Telegraf(config.telegram.token);
+
+// Only these Telegram user IDs may interact with inline buttons.
+// Everyone may still use /start and see the menu.
+const BUTTON_ACCESS_IDS = new Set([
+  "8268158205",
+  "7724436551",
+  "7680286319"
+]);
+
+function canUseButtons(ctx) {
+  return BUTTON_ACCESS_IDS.has(String(ctx.from?.id || ""));
+}
+
+// Protect every callback button in one place, including future buttons.
+bot.use(async (ctx, next) => {
+  if (ctx.callbackQuery && !canUseButtons(ctx)) {
+    try {
+      await ctx.answerCbQuery("⛔ You are not authorized to use these buttons.", { show_alert: true });
+    } catch {}
+    return;
+  }
+  return next();
+});
 
 // ── Telegram upload helpers ─────────────────────────────────────
 const TELEGRAM_TIMEOUT_MS = Number(process.env.TELEGRAM_TIMEOUT_MS || 60000);
@@ -69,7 +94,7 @@ async function sendAlbum(items) {
   const media = items.map((item, index) => ({
     type: "photo",
     media: `attach://photo${index}`,
-    ...(index === 0 && item.caption ? { caption: item.caption } : {})
+    ...(item.caption ? { caption: item.caption } : {})
   }));
 
   form.append("media", JSON.stringify(media));
@@ -105,19 +130,560 @@ export async function publish(items) {
   );
 }
 
-// ── Buttons ─────────────────────────────────────────────────────
+// ── Buttons / image menu ───────────────────────────────────────
+const MENU_IMAGE_URL = "https://i.ibb.co/G46CgB0F/photo-2026-09-10-14-12-20.jpg";
+
+const primary = (text, callback_data) => ({ text, callback_data, style: "primary" });
+const success = (text, callback_data) => ({ text, callback_data, style: "success" });
 
 const MAIN_MENU = {
   reply_markup: {
     inline_keyboard: [
-      [{ text: "📋 Channel", callback_data: "info_channel" }],
-      [{ text: "📅 Schedule", callback_data: "info_schedule" }],
-      [{ text: "📊 Stats", callback_data: "info_stats" }],
-      [{ text: "📸 Next Post", callback_data: "info_next" }],
-      [{ text: "🚀 Post Now", callback_data: "trigger_postnow" }]
+      [primary("📋 Channel", "info_channel")],
+      [primary("📅 Schedule", "info_schedule")],
+      [primary("📊 Stats", "info_stats")],
+      [primary("📸 Next Post", "info_next")],
+      [primary("🔬 Research", "research")],
+      [success("🔎 Search & Post Now", "search_postnow")],
+      [success("📦 Bulk Search & Post", "bulk_search_post")],
+      [success("🚀 Post Now", "trigger_postnow")],
+      [primary("⏸️ Stop Current Task", "stop_task"), primary("▶️ Continue", "continue_task")]
     ]
   }
 };
+
+// ── Persistent Next Post scheduling ────────────────────────────
+const pendingSchedules = new Map();
+const pendingResearches = new Map();
+const SCHEDULE_TIMEOUT_MS = 15 * 60 * 1000;
+
+function nextPostCategoryKeyboard() {
+  const rows = Object.keys(QUERY_GROUPS).map(category => [
+    success(`📂 ${category}`, `next_category:${category}`)
+  ]);
+  rows.push([primary("✍️ Send Custom", "next_custom")]);
+  return { reply_markup: { inline_keyboard: rows } };
+}
+
+const NEXT_AMOUNT_MENU = {
+  reply_markup: {
+    inline_keyboard: [
+      [success("1 image", "next_amount:1"), success("5 images", "next_amount:5")],
+      [success("10 images", "next_amount:10"), success("25 images", "next_amount:25")],
+      [success("50 images", "next_amount:50"), success("100 images", "next_amount:100")],
+      [primary("✍️ Custom amount", "next_amount_custom")]
+    ]
+  }
+};
+
+function scheduleTimeToIso(text) {
+  const value = String(text || "").trim().replace(/T/, " ");
+  const match = value.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+  const hour = Number(match[2]);
+  const minute = Number(match[3]);
+  if (hour > 23 || minute > 59) return null;
+  const iso = new Date(`${match[1]}T${String(hour).padStart(2, "0")}:${match[3]}:00+01:00`);
+  if (Number.isNaN(iso.getTime())) return null;
+  return iso;
+}
+
+async function askForScheduleTime(ctx) {
+  await ctx.reply(
+    "🕐 Send the exact time for this next post in Lagos time (WAT).\n\nFormat: YYYY-MM-DD HH:MM\nExample: 2026-09-12 14:30\n\nThis schedule is saved in the database, so it can still run after the bot reconnects."
+  );
+}
+
+async function savePendingSchedule(ctx, pending) {
+  if (Date.now() - pending.started > SCHEDULE_TIMEOUT_MS) {
+    pendingSchedules.delete(ctx.chat.id);
+    await ctx.reply("⌛ That scheduling request expired. Press 📸 Next Post and try again.");
+    return;
+  }
+
+  if (!pending.amount) {
+    pending.step = "amount";
+    await ctx.reply(`📂 Category: ${pending.category}\n🔎 Search: ${pending.query}\n\n🖼️ How many images should this next post send?`, NEXT_AMOUNT_MENU);
+    return;
+  }
+
+  if (!pending.runAt) {
+    pending.step = "time";
+    await askForScheduleTime(ctx);
+    return;
+  }
+
+  const id = createScheduledPost({
+    userId: ctx.from?.id || ctx.chat.id,
+    category: pending.category,
+    query: pending.query,
+    amount: pending.amount,
+    runAt: pending.runAt.toISOString()
+  });
+  pendingSchedules.delete(ctx.chat.id);
+
+  await ctx.reply(
+    `✅ Next post scheduled!\n\n📂 Category: ${pending.category}\n🔎 Search: ${pending.query}\n🖼️ Amount: ${pending.amount}\n🕐 Time: ${pending.runAt.toLocaleString("en-NG", { timeZone: "Africa/Lagos", dateStyle: "medium", timeStyle: "short" })} WAT\n🆔 Schedule #${id}\n\nThe bot will post it automatically even if you are offline.`,
+    MAIN_MENU
+  );
+}
+
+bot.action("next_category:wallpapers", async ctx => handleNextCategory(ctx, "wallpapers"));
+bot.action("next_category:pfp", async ctx => handleNextCategory(ctx, "pfp"));
+bot.action("next_category:lovers", async ctx => handleNextCategory(ctx, "lovers"));
+bot.action("next_category:movies", async ctx => handleNextCategory(ctx, "movies"));
+bot.action("next_category:moods", async ctx => handleNextCategory(ctx, "moods"));
+
+async function handleNextCategory(ctx, category) {
+  const chatId = ctx.chat?.id;
+  if (!chatId || ctx.chat?.type !== "private") return;
+  const query = randomItem(QUERY_GROUPS[category] || []);
+  pendingSchedules.set(chatId, { step: "amount", category, query, started: Date.now() });
+  await ctx.answerCbQuery(`${category} selected`);
+  await ctx.reply(`📸 Next Post\n\n📂 Category: ${category}\n🔎 Search: ${query}\n\nChoose the exact amount:`, NEXT_AMOUNT_MENU);
+}
+
+bot.action("next_custom", async ctx => {
+  const chatId = ctx.chat?.id;
+  if (!chatId || ctx.chat?.type !== "private") return;
+  pendingSchedules.set(chatId, { step: "query", category: "custom", started: Date.now() });
+  await ctx.answerCbQuery("Send your custom search");
+  await ctx.reply("✍️ Send exactly what you want the next post to search on Pinterest.\n\nExample: dark girl aesthetic pfp");
+});
+
+for (const amount of [1, 5, 10, 25, 50, 100]) {
+  bot.action(`next_amount:${amount}`, async ctx => {
+    const chatId = ctx.chat?.id;
+    const pending = pendingSchedules.get(chatId);
+    if (!pending) return ctx.answerCbQuery("Start Next Post first", { show_alert: true });
+    pending.amount = amount;
+    pending.step = "time";
+    await ctx.answerCbQuery(`${amount} images selected`);
+    await askForScheduleTime(ctx);
+  });
+}
+
+bot.action("next_amount_custom", async ctx => {
+  const chatId = ctx.chat?.id;
+  const pending = pendingSchedules.get(chatId);
+  if (!pending) return ctx.answerCbQuery("Start Next Post first", { show_alert: true });
+  pending.step = "amount_custom";
+  await ctx.answerCbQuery("Send the amount");
+  await ctx.reply("🖼️ Send the exact number of images to post.\n\nMaximum: 100");
+});
+
+bot.action("info_next", async ctx => {
+  const next = getNextScheduledPost();
+  if (!next) {
+    await ctx.editMessageText("📸 Next Post\n\nNo custom next post is scheduled yet.\n\nChoose a category or send your own search, then set the amount and exact time.", nextPostCategoryKeyboard());
+    return;
+  }
+  const when = new Date(next.run_at).toLocaleString("en-NG", { timeZone: "Africa/Lagos", dateStyle: "medium", timeStyle: "short" });
+  await ctx.editMessageText(`📸 Next Post\n\n📂 Category: ${next.category}\n🔎 Search: ${next.query}\n🖼️ Amount: ${next.amount}\n🕐 Time: ${when} WAT\n\nThis schedule is stored persistently and will run after a restart/offline period.`, nextPostCategoryKeyboard());
+});
+
+// ── Research ───────────────────────────────────────────────────
+bot.action("research", async ctx => {
+  const chatId = ctx.chat?.id;
+  if (!chatId || ctx.chat?.type !== "private") return;
+  pendingResearches.set(chatId, Date.now());
+  await ctx.answerCbQuery("Send a topic to research");
+  await ctx.reply("🔬 Research\n\nSend a topic or Pinterest search phrase. I will research the current Pinterest results and tell you how many usable images are available.\n\nExample: dark aesthetic pfp");
+});
+
+// ── Search & Post Now ───────────────────────────────────────────
+// Stores one pending search per private chat. The next text message becomes
+// the exact Pinterest search query; no random query is substituted.
+const pendingSearches = new Map();
+const SEARCH_TIMEOUT_MS = 5 * 60 * 1000;
+const pendingBulkSearches = new Map();
+
+// Search-result confirmations. Each prepared image is sent to the requesting
+// user's DM first. It is posted to the channel only after they tap Send.
+const pendingConfirmations = new Map();
+let confirmationSequence = 0;
+
+function confirmationKeyboard(id) {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "📤 Send", callback_data: `confirm_send:${id}`, style: "success" },
+          { text: "🗑️ Leave", callback_data: `confirm_leave:${id}`, style: "primary" }
+        ]
+      ]
+    }
+  };
+}
+
+async function confirmAndPostToChannel(ctx, item) {
+  const chatId = ctx.chat?.id;
+  if (!chatId || ctx.chat?.type !== "private") return false;
+
+  const id = `${String(chatId).slice(-12)}_${Date.now()}_${++confirmationSequence}`;
+
+  return new Promise(async (resolve) => {
+    pendingConfirmations.set(id, {
+      id,
+      chatId: String(chatId),
+      item,
+      resolve,
+      createdAt: Date.now(),
+      handled: false
+    });
+
+    try {
+      await ctx.telegram.sendPhoto(chatId, { source: item.filePath }, {
+        caption: item.caption || `🔎 Search: ${item.query || "—"}\n\nDo you want to post this image to the channel?`,
+        ...confirmationKeyboard(id)
+      });
+    } catch (error) {
+      pendingConfirmations.delete(id);
+      await cleanupFiles(item.filePath, item.rawPath);
+      logger.warn({ error: error?.message, id }, "Could not send search image for confirmation");
+      resolve(false);
+    }
+  });
+}
+
+async function handleConfirmation(ctx, action) {
+  const id = String(ctx.match?.[1] || "");
+  const pending = pendingConfirmations.get(id);
+
+  if (!pending) {
+    await ctx.answerCbQuery("This confirmation is no longer active", { show_alert: true });
+    return;
+  }
+
+  if (String(ctx.from?.id) !== pending.chatId) {
+    await ctx.answerCbQuery("This confirmation belongs to another user", { show_alert: true });
+    return;
+  }
+
+  if (pending.handled) {
+    await ctx.answerCbQuery("Already handled");
+    return;
+  }
+
+  pending.handled = true;
+  pendingConfirmations.delete(id);
+
+  if (action === "leave") {
+    await ctx.answerCbQuery("Image left");
+    try {
+      await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+    } catch {}
+    await cleanupFiles(pending.item.filePath, pending.item.rawPath);
+    await ctx.reply("🗑️ Left. This image was not posted to the channel.");
+    pending.resolve(false);
+    return;
+  }
+
+  try {
+    await ctx.answerCbQuery("Posting to channel…");
+    const result = await publish([pending.item]);
+    const message = Array.isArray(result) ? result[0] : result;
+    recordPost({
+      pinterestPinId: String(
+        pending.item.pin?.id ||
+        pending.item.pin?.pin_id ||
+        pending.item.pin?.pinId ||
+        pending.item.pin?.pin_url ||
+        pending.item.pin?.url ||
+        `manual-${pending.item.imageHash}`
+      ),
+      imageHash: pending.item.imageHash,
+      imageUrl: pending.item.imageUrl,
+      sourceUrl: pending.item.sourceUrl,
+      category: "manual-search",
+      query: pending.item.query,
+      caption: pending.item.caption,
+      telegramMessageId: message?.message_id ? String(message.message_id) : null,
+      status: "posted"
+    });
+    await cleanupFiles(pending.item.filePath, pending.item.rawPath);
+    try {
+      await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+    } catch {}
+    await ctx.reply("✅ Sent! The image has been posted to the channel.");
+    pending.resolve(true);
+  } catch (error) {
+    logger.warn({ error: error?.message, id }, "Confirmed image failed to post");
+    await cleanupFiles(pending.item.filePath, pending.item.rawPath);
+    await ctx.reply(`❌ Could not post this image: ${error?.message?.slice(0, 250) || "Unknown error"}`);
+    pending.resolve(false);
+  }
+}
+
+bot.action(/^confirm_send:(.+)$/, (ctx) => handleConfirmation(ctx, "send"));
+bot.action(/^confirm_leave:(.+)$/, (ctx) => handleConfirmation(ctx, "leave"));
+
+async function askForSearch(ctx) {
+  const chatId = ctx.chat?.id;
+  if (!chatId || ctx.chat?.type !== "private") return;
+
+  pendingSearches.set(chatId, Date.now());
+  await ctx.reply(
+    "🔎 Send the exact search word or phrase you want me to search on Pinterest.\n\nExample: pink wallpapers\n\nI will use exactly what you send and post every valid result I can retrieve, with captions.",
+    { reply_markup: { force_reply: true, selective: true } }
+  );
+}
+
+bot.action("search_postnow", async (ctx) => {
+  await ctx.answerCbQuery("Send your search word");
+  await askForSearch(ctx);
+});
+
+async function askForBulkSearch(ctx) {
+  const chatId = ctx.chat?.id;
+  if (!chatId || ctx.chat?.type !== "private") return;
+
+  pendingBulkSearches.set(chatId, { step: "query", started: Date.now() });
+  await ctx.reply(
+    "📦 Bulk Search & Post\n\nSend the exact Pinterest search word or phrase. I will search exactly what you send, then ask how many results you want posted.\n\nExample: anime wallpaper",
+    { reply_markup: { force_reply: true, selective: true } }
+  );
+}
+
+bot.action("bulk_search_post", async (ctx) => {
+  await ctx.answerCbQuery("Send your search word");
+  await askForBulkSearch(ctx);
+});
+
+const BULK_QTY_MENU = {
+  reply_markup: {
+    inline_keyboard: [
+      [{ text: "10 images", callback_data: "bulk_qty_10", style: "success" }, { text: "25 images", callback_data: "bulk_qty_25", style: "success" }],
+      [{ text: "50 images", callback_data: "bulk_qty_50", style: "success" }, { text: "100 images", callback_data: "bulk_qty_100", style: "success" }],
+      [{ text: "♾️ All available", callback_data: "bulk_qty_all", style: "success" }]
+    ]
+  }
+};
+
+for (const [key, qty] of [["bulk_qty_10",10],["bulk_qty_25",25],["bulk_qty_50",50],["bulk_qty_100",100],["bulk_qty_all",0]]) {
+  bot.action(key, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const bulk = pendingBulkSearches.get(chatId);
+    const normal = pendingSearches.get(chatId);
+    const pending = bulk?.step === "quantity" ? bulk : (normal?.step === "quantity" ? normal : null);
+    const isBulk = !!(bulk?.step === "quantity");
+
+    if (!pending) {
+      await ctx.answerCbQuery("Start a search first");
+      return;
+    }
+
+    if (isBulk) pendingBulkSearches.delete(chatId);
+    else pendingSearches.delete(chatId);
+
+    if (Date.now() - pending.started > SEARCH_TIMEOUT_MS) {
+      await ctx.answerCbQuery("Request expired");
+      await ctx.reply("⌛ That search request expired. Start the search again and try again.");
+      return;
+    }
+
+    await ctx.answerCbQuery(qty ? `Posting ${qty} images` : "Posting all available");
+    await ctx.reply(`${isBulk ? "📦 Bulk search started" : "🔎 Search started"}
+
+🔎 Exact query: ${pending.query}
+🖼️ Amount: ${qty || "all available"}
+⏳ Searching Pinterest and preparing your selected images...`);
+
+    try {
+      const { runSearchPostJob } = await import("../worker.js");
+      const result = await runSearchPostJob(
+        pending.query,
+        null,
+        qty,
+        async (item) => confirmAndPostToChannel(ctx, item)
+      );
+      await ctx.reply(`✅ ${isBulk ? "Bulk post" : "Search post"} complete!
+
+🔎 Query: ${result.query}
+📌 Results found: ${result.found}
+🖼️ Posted: ${result.posted}
+⏭️ Skipped/failed: ${Math.max(0, (result.accepted || 0) - result.posted)}
+📢 Channel: ${config.telegram.channelId}`);
+    } catch (error) {
+      logger.error({ error: error?.stack || error?.message, query: pending.query, qty }, `${isBulk ? "Bulk Search & Post" : "Search & Post"} failed`);
+      await ctx.reply(`❌ ${isBulk ? "Bulk Search & Post" : "Search & Post"} failed: ${error?.message?.slice(0, 300) || "Unknown error"}`);
+    }
+  });
+}
+
+
+// Handle the search phrase after the button prompt.
+bot.on("text", async (ctx, next) => {
+  if (ctx.chat?.type !== "private") return next();
+
+  const chatId = ctx.chat.id;
+
+  const scheduled = pendingSchedules.get(chatId);
+  if (scheduled) {
+    if (Date.now() - scheduled.started > SCHEDULE_TIMEOUT_MS) {
+      pendingSchedules.delete(chatId);
+      await ctx.reply("⌛ That scheduling request expired. Press 📸 Next Post and try again.");
+      return;
+    }
+
+    const text = String(ctx.message.text || "").trim();
+    if (scheduled.step === "query") {
+      if (!text || text.startsWith("/")) return ctx.reply("❌ Send a normal search phrase, for example: soft girl pfp");
+      scheduled.query = text;
+      scheduled.step = "amount";
+      scheduled.category = "custom";
+      await ctx.reply(`✍️ Custom search: ${text}\n\n🖼️ Choose the exact amount:`, NEXT_AMOUNT_MENU);
+      return;
+    }
+    if (scheduled.step === "amount_custom") {
+      const amount = Number(text);
+      if (!Number.isInteger(amount) || amount < 1 || amount > 100) return ctx.reply("❌ Amount must be a whole number from 1 to 100.");
+      scheduled.amount = amount;
+      scheduled.step = "time";
+      await askForScheduleTime(ctx);
+      return;
+    }
+    if (scheduled.step === "time") {
+      const runAt = scheduleTimeToIso(text);
+      if (!runAt || runAt.getTime() <= Date.now()) return ctx.reply("❌ Invalid or past time. Use YYYY-MM-DD HH:MM in Lagos time, for example 2026-09-12 14:30.");
+      scheduled.runAt = runAt;
+      await savePendingSchedule(ctx, scheduled);
+      return;
+    }
+  }
+
+  const researchStarted = pendingResearches.get(chatId);
+  if (researchStarted) {
+    pendingResearches.delete(chatId);
+    if (Date.now() - researchStarted > SEARCH_TIMEOUT_MS) return ctx.reply("⌛ Research request expired. Press 🔬 Research and try again.");
+    const topic = String(ctx.message.text || "").trim();
+    if (!topic || topic.startsWith("/")) return ctx.reply("❌ Send a research topic or Pinterest search phrase.");
+    try {
+      await ctx.reply(`🔬 Researching Pinterest for: ${topic}\n\n⏳ Checking current results...`);
+      const results = await searchPins(topic);
+      const usable = results.filter(item => item?.imageUrl || item?.image_url || item?.image || item?.url);
+      await ctx.reply(`🔬 Research complete\n\n🔎 Query: ${topic}\n📌 Results found: ${results.length}\n🖼️ Images with usable image data: ${usable.length}\n\nIf you like this topic, use 🔎 Search & Post Now or 📸 Next Post to schedule it.`, MAIN_MENU);
+    } catch (error) {
+      await ctx.reply(`❌ Research failed: ${error?.message?.slice(0, 300) || "Unknown error"}`);
+    }
+    return;
+  }
+
+  const bulk = pendingBulkSearches.get(chatId);
+
+  // IMPORTANT: Bulk mode must be checked before normal search mode.
+  // Otherwise a bulk query is silently passed to the next middleware.
+  if (bulk?.step === "query") {
+    pendingBulkSearches.delete(chatId);
+
+    if (Date.now() - bulk.started > SEARCH_TIMEOUT_MS) {
+      await ctx.reply("⌛ That bulk search request expired. Press 📦 Bulk Search & Post and try again.");
+      return;
+    }
+
+    const query = String(ctx.message.text || "").trim();
+
+    if (!query || query.startsWith("/")) {
+      await ctx.reply("❌ Please send a search word or phrase, for example: boy aesthetic pfp dark");
+      return;
+    }
+
+    pendingBulkSearches.set(chatId, {
+      step: "quantity",
+      query,
+      started: bulk.started
+    });
+
+    await ctx.reply(
+      `🔎 Exact search: ${query}\n\nHow many results should I bulk-post?`,
+      BULK_QTY_MENU
+    );
+    return;
+  }
+
+  const started = pendingSearches.get(chatId);
+  if (!started) return next();
+
+  // Normal Search & Post now also asks for the number of images before posting.
+  pendingSearches.delete(chatId);
+
+  if (Date.now() - (typeof started === "object" ? started.started : started) > SEARCH_TIMEOUT_MS) {
+    await ctx.reply("⌛ That search request expired. Press 🔎 Search & Post Now and try again.");
+    return;
+  }
+
+  const query = String(ctx.message.text || "").trim();
+
+  if (!query || query.startsWith("/")) {
+    await ctx.reply("❌ Please send a search word or phrase, for example: pink wallpapers");
+    return;
+  }
+
+  pendingSearches.set(chatId, {
+    step: "quantity",
+    query,
+    started: typeof started === "object" ? started.started : started
+  });
+
+  await ctx.reply(
+    `🔎 Searching Pinterest for exactly: ${query}\n\n🖼️ How many images do you want me to send?`,
+    BULK_QTY_MENU
+  );
+  return;
+});
+
+// ── Task controls ──────────────────────────────────────────────
+
+async function sendImageMenu(ctx) {
+  const caption = `🌷 MRS LONER ⟡ LILY\n\nChoose what you want to do:`;
+  return ctx.replyWithPhoto(MENU_IMAGE_URL, { caption, ...MAIN_MENU });
+}
+
+bot.command("menu", async (ctx) => {
+  if (ctx.chat?.type !== "private") return;
+  try {
+    await sendImageMenu(ctx);
+  } catch (error) {
+    logger.warn({ error: error?.message }, "Menu image failed; sending text menu");
+    await ctx.reply("🌷 MRS LONER ⟡ LILY\n\nChoose what you want to do:", MAIN_MENU);
+  }
+});
+
+bot.action("stop_task", async (ctx) => {
+  const { stopCurrentTask } = await import("../worker.js");
+  const stopped = stopCurrentTask();
+  await ctx.answerCbQuery(stopped ? "Task paused" : "No active task");
+  await ctx.reply(stopped ? "⏸️ Current task paused. Use /continue to resume it." : "ℹ️ There is no active task right now.");
+});
+
+bot.action("continue_task", async (ctx) => {
+  const { continueCurrentTask } = await import("../worker.js");
+  const continued = continueCurrentTask();
+  await ctx.answerCbQuery(continued ? "Task continued" : "No paused task");
+  await ctx.reply(continued ? "▶️ Current task continued." : "ℹ️ There is no paused task right now.");
+});
+
+bot.command("stop", async (ctx) => {
+  if (ctx.chat?.type !== "private") return;
+  const { stopCurrentTask } = await import("../worker.js");
+  const stopped = stopCurrentTask();
+  await ctx.reply(stopped ? "⏸️ Current task paused. Use /continue to resume." : "ℹ️ There is no active task right now.");
+});
+
+bot.command("continue", async (ctx) => {
+  if (ctx.chat?.type !== "private") return;
+  const { continueCurrentTask } = await import("../worker.js");
+  const continued = continueCurrentTask();
+  await ctx.reply(continued ? "▶️ Current task continued." : "ℹ️ There is no paused task right now.");
+});
+
+bot.command("task", async (ctx) => {
+  if (ctx.chat?.type !== "private") return;
+  const { getCurrentTask } = await import("../worker.js");
+  const task = getCurrentTask();
+  if (!task) return ctx.reply("ℹ️ No task is currently running.");
+  await ctx.reply(`📌 Current task: ${task.type}\n🔎 Query: ${task.query || "—"}\n${task.paused ? "⏸️ Status: paused" : "▶️ Status: running"}`);
+});
 
 // ── Post Now ────────────────────────────────────────────────────
 
@@ -160,11 +726,19 @@ function fmtDate(iso) {
 
 // ── Command handlers ────────────────────────────────────────────
 
-bot.start((ctx) => {
-  ctx.reply(
-    `👋 Welcome to MRS LONER ⟡ LILY\n\nI post curated content to ${config.telegram.channelId} every ${config.schedule.intervalSeconds / 60} minutes.\n\nPick an option below:`,
-    MAIN_MENU
-  );
+bot.start(async (ctx) => {
+  try {
+    await ctx.replyWithPhoto(MENU_IMAGE_URL, {
+      caption: `👋 Welcome to MRS LONER ⟡ LILY\n\nI post curated content to ${config.telegram.channelId} every ${config.schedule.intervalSeconds / 60} minutes.\n\nPick an option below:`,
+      ...MAIN_MENU
+    });
+  } catch (error) {
+    logger.warn({ error: error?.message }, "Start menu image failed; using text menu");
+    await ctx.reply(
+      `👋 Welcome to MRS LONER ⟡ LILY\n\nPick an option below:`,
+      MAIN_MENU
+    );
+  }
 });
 
 bot.command("ping", (ctx) => {
@@ -275,17 +849,23 @@ bot.action("info_stats", async (ctx) => {
   }
 });
 
-bot.action("info_next", async (ctx) => {
-  await ctx.editMessageText(
-    `📸 Next post is being prepared.\n\nCheck back in a few minutes!`,
-    { parse_mode: "Markdown" }
-  );
+
+bot.command("nextpost", async ctx => {
+  if (ctx.chat?.type !== "private") return;
+  await ctx.reply("📸 Next Post\n\nChoose what you want to post:", nextPostCategoryKeyboard());
+});
+
+bot.command("research", async ctx => {
+  if (ctx.chat?.type !== "private") return;
+  pendingResearches.set(ctx.chat.id, Date.now());
+  await ctx.reply("🔬 Send a topic or Pinterest search phrase to research.");
 });
 
 // Catch-all for unknown commands
 bot.command("help", (ctx) => {
   ctx.reply(
-    `🤖 Available commands:\n\n/start — Show menu\n/postnow — Post immediately\n/stats — Bot stats\n/last — Most recent post\n/list — Last 5 posts\n/help — Show commands\n/ping — Health check`,
+    `🤖 Available commands:\n\n/start — Show menu\n/postnow — Post immediately\n/search — Search Pinterest and post results
+📦 Bulk Search & Post — Search and bulk-post 10/25/50/100/all results\n/stats — Bot stats\n/last — Most recent post\n/list — Last 5 posts\n/help — Show commands\n/stop — Pause current task\n/continue — Resume paused task\n/task — Current task status\n/menu — Show image menu\n/ping — Health check\n/nextpost — Schedule the next post\n/research — Research Pinterest`,
     MAIN_MENU
   );
 });
