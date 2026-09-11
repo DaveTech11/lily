@@ -111,10 +111,50 @@ async function prepareCandidate(candidate, category, query) {
       })
     };
   } catch (error) {
-    logger.warn({ error: error.message, imageUrl: candidate.imageUrl }, "Candidate rejected during download/processing");
+    logger.warn(
+      { error: error?.message || String(error), imageUrl: candidate.imageUrl },
+      "Candidate rejected during download/processing; skipping"
+    );
     await cleanupFiles(rawPath, processedPath);
     return null;
   }
+}
+
+async function prepareUntilCount(candidates, count, category, query, onProgress = null) {
+  const target = Math.max(1, Number(count) || 1);
+  const prepared = [];
+  const maxAttempts = candidates.length;
+
+  for (let i = 0; i < maxAttempts && prepared.length < target; i++) {
+    await waitIfPaused();
+    const candidate = candidates[i];
+
+    if (onProgress) {
+      await onProgress({
+        phase: "preparing",
+        current: prepared.length + 1,
+        total: target,
+        attempted: i + 1,
+        available: maxAttempts
+      });
+    }
+
+    const item = await prepareCandidate(candidate, category, query);
+    if (item) {
+      prepared.push(item);
+      if (onProgress) {
+        await onProgress({
+          phase: "prepared",
+          current: prepared.length,
+          total: target,
+          attempted: i + 1,
+          available: maxAttempts
+        });
+      }
+    }
+  }
+
+  return prepared;
 }
 
 async function publishPrepared(prepared, category, query) {
@@ -201,14 +241,12 @@ export async function runScheduledPostJob({ category, query, amount }) {
     if (!items.length) return { query, found: 0, posted: 0 };
 
     const candidates = filterCandidates(items, category || "scheduled");
-    const prepared = [];
-
-    for (const candidate of candidates) {
-      await waitIfPaused();
-      const item = await prepareCandidate(candidate, category || "scheduled", query);
-      if (item) prepared.push(item);
-      if (prepared.length >= count) break;
-    }
+    const prepared = await prepareUntilCount(
+      candidates,
+      count,
+      category || "scheduled",
+      query
+    );
 
     const posted = await publishPrepared(prepared, category || "scheduled", query);
     logger.info({ category, query, requested: count, found: items.length, posted, elapsedMs: Date.now() - startedAt }, "Scheduled next post completed");
@@ -238,15 +276,13 @@ export async function runHourlyJob() {
     }
 
     const hourlyCount = 10;
-    const selected = selectDiverse(candidates, Math.min(candidates.length, candidates.length));
-    const prepared = [];
-
-    for (const candidate of selected) {
-      await waitIfPaused();
-      const item = await prepareCandidate(candidate, category, query);
-      if (item) prepared.push(item);
-      if (prepared.length >= hourlyCount) break;
-    }
+    const selected = selectDiverse(candidates, hourlyCount);
+    const prepared = await prepareUntilCount(
+      selected,
+      hourlyCount,
+      category,
+      query
+    );
 
     if (!prepared.length) {
       logger.warn({ category, query }, "No images survived processing");
@@ -282,7 +318,7 @@ export async function runHourlyJob() {
   }
 }
 
-export async function runSearchPostJob(exactQuery, onProgress = null, bulkLimit = 0, onConfirm = null) {
+export async function runSearchPostJob(exactQuery, onProgress = null, bulkLimit = 0) {
   const query = String(exactQuery || "").trim();
   if (!query) throw new Error("Search word cannot be empty");
 
@@ -301,50 +337,22 @@ export async function runSearchPostJob(exactQuery, onProgress = null, bulkLimit 
 
     const limit = Number.isFinite(Number(bulkLimit)) && Number(bulkLimit) > 0 ? Number(bulkLimit) : 0;
     const target = limit || candidates.length;
-
-    const prepared = [];
-    let attempted = 0;
-    for (const candidate of candidates) {
-      if (prepared.length >= target) break;
-      await waitIfPaused();
-      attempted++;
-      const item = await prepareCandidate(candidate, "manual-search", query);
-      if (item) prepared.push(item);
-      if (onProgress) {
-        await onProgress({
-          phase: "preparing",
-          current: attempted,
-          total: candidates.length,
-          prepared: prepared.length,
-          target
-        });
-      }
-    }
+    const prepared = await prepareUntilCount(
+      candidates,
+      target,
+      "manual-search",
+      query,
+      onProgress
+    );
+    const candidatesToPrepare = candidates;
 
     await waitIfPaused();
 
-    // When a confirmation callback is supplied, each prepared image is sent
-    // to the requesting user's DM. Tapping Send posts it immediately; Leave
-    // discards it. Scheduled jobs do not use this path.
-    if (typeof onConfirm === "function") {
-      let posted = 0;
-      let left = 0;
-
-      for (const item of prepared) {
-        await waitIfPaused();
-        const approved = await onConfirm(item);
-        if (approved) posted++;
-        else left++;
-      }
-
-      logger.info({ query, found: items.length, accepted: candidates.length, attempted, prepared: prepared.length, posted, left, elapsedMs: Date.now() - startedAt }, "Manual search confirmation flow completed");
-      return { query, found: items.length, accepted: candidates.length, attempted, prepared: prepared.length, posted, left };
-    }
-
+    // Post directly. The requested amount is preserved by `target` above.
     const posted = await publishPrepared(prepared, "manual-search", query);
 
-    logger.info({ query, found: items.length, accepted: candidates.length, attempted, prepared: prepared.length, posted, elapsedMs: Date.now() - startedAt }, "Manual search post completed");
-    return { query, found: items.length, accepted: candidates.length, attempted, prepared: prepared.length, posted };
+    logger.info({ query, found: items.length, accepted: candidates.length, prepared: prepared.length, posted, elapsedMs: Date.now() - startedAt }, "Manual search post completed");
+    return { query, found: items.length, accepted: candidates.length, prepared: prepared.length, posted };
   } finally {
     finishTask();
   }

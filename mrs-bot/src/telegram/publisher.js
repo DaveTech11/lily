@@ -87,9 +87,9 @@ async function sendSingle(item) {
   return telegramRequest("sendPhoto", form);
 }
 
-async function sendAlbum(items) {
+async function sendAlbum(items, chatId = config.telegram.channelId) {
   const form = new FormData();
-  form.append("chat_id", String(config.telegram.channelId));
+  form.append("chat_id", String(chatId));
 
   const media = items.map((item, index) => ({
     type: "photo",
@@ -172,6 +172,18 @@ const NEXT_AMOUNT_MENU = {
       [success("10 images", "next_amount:10"), success("25 images", "next_amount:25")],
       [success("50 images", "next_amount:50"), success("100 images", "next_amount:100")],
       [primary("✍️ Custom amount", "next_amount_custom")]
+    ]
+  }
+};
+
+// Amount picker for "Search & Post Now" and "Bulk Search & Post". Picking
+// any button here posts immediately — there is no confirmation step.
+const BULK_QTY_MENU = {
+  reply_markup: {
+    inline_keyboard: [
+      [success("5", "qty:5"), success("10", "qty:10"), success("25", "qty:25")],
+      [success("50", "qty:50"), success("100", "qty:100")],
+      [primary("📦 All results", "qty:all")]
     ]
   }
 };
@@ -298,239 +310,23 @@ const pendingSearches = new Map();
 const SEARCH_TIMEOUT_MS = 5 * 60 * 1000;
 const pendingBulkSearches = new Map();
 
-// Search-result confirmations. Each prepared image is sent to the requesting
-// user's DM first. It is posted to the channel only after they tap Send.
-const pendingConfirmations = new Map();
-let confirmationSequence = 0;
+// Search results are posted directly after the user selects the amount.
 
-function confirmationKeyboard(id) {
-  return {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "📤 Send", callback_data: `confirm_send:${id}`, style: "success" },
-          { text: "🗑️ Leave", callback_data: `confirm_leave:${id}`, style: "primary" }
-        ]
-      ]
-    }
-  };
-}
-
-async function confirmAndPostToChannel(ctx, item) {
-  const chatId = ctx.chat?.id;
-  if (!chatId || ctx.chat?.type !== "private") return false;
-
-  const id = `${String(chatId).slice(-12)}_${Date.now()}_${++confirmationSequence}`;
-
-  return new Promise(async (resolve) => {
-    pendingConfirmations.set(id, {
-      id,
-      chatId: String(chatId),
-      item,
-      resolve,
-      createdAt: Date.now(),
-      handled: false
-    });
-
-    try {
-      await ctx.telegram.sendPhoto(chatId, { source: item.filePath }, {
-        caption: item.caption || `🔎 Search: ${item.query || "—"}\n\nDo you want to post this image to the channel?`,
-        ...confirmationKeyboard(id)
-      });
-    } catch (error) {
-      pendingConfirmations.delete(id);
-      await cleanupFiles(item.filePath, item.rawPath);
-      logger.warn({ error: error?.message, id }, "Could not send search image for confirmation");
-      resolve(false);
-    }
-  });
-}
-
-async function handleConfirmation(ctx, action) {
-  const id = String(ctx.match?.[1] || "");
-  const pending = pendingConfirmations.get(id);
-
-  if (!pending) {
-    await ctx.answerCbQuery("This confirmation is no longer active", { show_alert: true });
-    return;
-  }
-
-  if (String(ctx.from?.id) !== pending.chatId) {
-    await ctx.answerCbQuery("This confirmation belongs to another user", { show_alert: true });
-    return;
-  }
-
-  if (pending.handled) {
-    await ctx.answerCbQuery("Already handled");
-    return;
-  }
-
-  pending.handled = true;
-  pendingConfirmations.delete(id);
-
-  if (action === "leave") {
-    await ctx.answerCbQuery("Image left");
-    try {
-      await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
-    } catch {}
-    await cleanupFiles(pending.item.filePath, pending.item.rawPath);
-    await ctx.reply("🗑️ Left. This image was not posted to the channel.");
-    pending.resolve(false);
-    return;
-  }
-
-  try {
-    await ctx.answerCbQuery("Posting to channel…");
-    const result = await publish([pending.item]);
-    const message = Array.isArray(result) ? result[0] : result;
-    recordPost({
-      pinterestPinId: String(
-        pending.item.pin?.id ||
-        pending.item.pin?.pin_id ||
-        pending.item.pin?.pinId ||
-        pending.item.pin?.pin_url ||
-        pending.item.pin?.url ||
-        `manual-${pending.item.imageHash}`
-      ),
-      imageHash: pending.item.imageHash,
-      imageUrl: pending.item.imageUrl,
-      sourceUrl: pending.item.sourceUrl,
-      category: "manual-search",
-      query: pending.item.query,
-      caption: pending.item.caption,
-      telegramMessageId: message?.message_id ? String(message.message_id) : null,
-      status: "posted"
-    });
-    await cleanupFiles(pending.item.filePath, pending.item.rawPath);
-    try {
-      await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
-    } catch {}
-    await ctx.reply("✅ Sent! The image has been posted to the channel.");
-    pending.resolve(true);
-  } catch (error) {
-    logger.warn({ error: error?.message, id }, "Confirmed image failed to post");
-    await cleanupFiles(pending.item.filePath, pending.item.rawPath);
-    await ctx.reply(`❌ Could not post this image: ${error?.message?.slice(0, 250) || "Unknown error"}`);
-    pending.resolve(false);
-  }
-}
-
-bot.action(/^confirm_send:(.+)$/, (ctx) => handleConfirmation(ctx, "send"));
-bot.action(/^confirm_leave:(.+)$/, (ctx) => handleConfirmation(ctx, "leave"));
-
-async function askForSearch(ctx) {
+bot.action("search_postnow", async ctx => {
   const chatId = ctx.chat?.id;
   if (!chatId || ctx.chat?.type !== "private") return;
-
   pendingSearches.set(chatId, Date.now());
-  await ctx.reply(
-    "🔎 Send the exact search word or phrase you want me to search on Pinterest.\n\nExample: pink wallpapers\n\nI will use exactly what you send and post every valid result I can retrieve, with captions.",
-    { reply_markup: { force_reply: true, selective: true } }
-  );
-}
-
-bot.action("search_postnow", async (ctx) => {
-  await ctx.answerCbQuery("Send your search word");
-  await askForSearch(ctx);
+  await ctx.answerCbQuery("Send your search");
+  await ctx.reply("🔎 Search & Post Now\n\nSend the exact word or phrase to search on Pinterest.\n\nExample: pink wallpapers");
 });
 
-async function askForBulkSearch(ctx) {
+bot.action("bulk_search_post", async ctx => {
   const chatId = ctx.chat?.id;
   if (!chatId || ctx.chat?.type !== "private") return;
-
   pendingBulkSearches.set(chatId, { step: "query", started: Date.now() });
-  await ctx.reply(
-    "📦 Bulk Search & Post\n\nSend the exact Pinterest search word or phrase. I will search exactly what you send, then ask how many results you want posted.\n\nExample: anime wallpaper",
-    { reply_markup: { force_reply: true, selective: true } }
-  );
-}
-
-bot.action("bulk_search_post", async (ctx) => {
-  await ctx.answerCbQuery("Send your search word");
-  await askForBulkSearch(ctx);
+  await ctx.answerCbQuery("Send your search");
+  await ctx.reply("📦 Bulk Search & Post\n\nSend the exact word or phrase to search on Pinterest.\n\nExample: boy aesthetic pfp dark");
 });
-
-const BULK_QTY_MENU = {
-  reply_markup: {
-    inline_keyboard: [
-      [{ text: "10 images", callback_data: "bulk_qty_10", style: "success" }, { text: "25 images", callback_data: "bulk_qty_25", style: "success" }],
-      [{ text: "50 images", callback_data: "bulk_qty_50", style: "success" }, { text: "100 images", callback_data: "bulk_qty_100", style: "success" }],
-      [{ text: "♾️ All available", callback_data: "bulk_qty_all", style: "success" }]
-    ]
-  }
-};
-
-for (const [key, qty] of [["bulk_qty_10",10],["bulk_qty_25",25],["bulk_qty_50",50],["bulk_qty_100",100],["bulk_qty_all",0]]) {
-  bot.action(key, async (ctx) => {
-    const chatId = ctx.chat?.id;
-    const bulk = pendingBulkSearches.get(chatId);
-    const normal = pendingSearches.get(chatId);
-    const pending = bulk?.step === "quantity" ? bulk : (normal?.step === "quantity" ? normal : null);
-    const isBulk = !!(bulk?.step === "quantity");
-
-    if (!pending) {
-      await ctx.answerCbQuery("Start a search first");
-      return;
-    }
-
-    if (isBulk) pendingBulkSearches.delete(chatId);
-    else pendingSearches.delete(chatId);
-
-    if (Date.now() - pending.started > SEARCH_TIMEOUT_MS) {
-      await ctx.answerCbQuery("Request expired");
-      await ctx.reply("⌛ That search request expired. Start the search again and try again.");
-      return;
-    }
-
-    await ctx.answerCbQuery(qty ? `Posting ${qty} images` : "Posting all available");
-    await ctx.reply(`${isBulk ? "📦 Bulk search started" : "🔎 Search started"}
-
-🔎 Exact query: ${pending.query}
-🖼️ Amount: ${qty || "all available"}
-⏳ Searching Pinterest and preparing your selected images...`);
-
-    try {
-      const { runSearchPostJob } = await import("../worker.js");
-      const progressMessage = await ctx.reply(
-        `⏳ ᴘʀᴏᴄᴇssɪɴɢ 0/${qty || "available"}\n🔎 ${pending.query}`
-      );
-      let lastProgressAt = 0;
-
-      const result = await runSearchPostJob(
-        pending.query,
-        async ({ prepared = 0, target = qty || 0 }) => {
-          const now = Date.now();
-          if (now - lastProgressAt < 700 && prepared < target) return;
-          lastProgressAt = now;
-          const totalLabel = target || "available";
-          try {
-            await ctx.telegram.editMessageText(
-              ctx.chat.id,
-              progressMessage.message_id,
-              undefined,
-              `⏳ ᴘʀᴏᴄᴇssɪɴɢ ${prepared}/${totalLabel}\n🔎 ${pending.query}`
-            );
-          } catch {
-            // Ignore progress-edit failures and keep the posting task alive.
-          }
-        },
-        qty,
-        async (item) => confirmAndPostToChannel(ctx, item)
-      );
-      await ctx.reply(`✅ ${isBulk ? "Bulk post" : "Search post"} complete!
-
-🔎 Query: ${result.query}
-📌 Results found: ${result.found}
-🖼️ Posted: ${result.posted}
-⏭️ Skipped/failed: ${Math.max(0, (result.accepted || 0) - result.posted)}
-📢 Channel: ${config.telegram.channelId}`);
-    } catch (error) {
-      logger.error({ error: error?.stack || error?.message, query: pending.query, qty }, `${isBulk ? "Bulk Search & Post" : "Search & Post"} failed`);
-      await ctx.reply(`❌ ${isBulk ? "Bulk Search & Post" : "Search & Post"} failed: ${error?.message?.slice(0, 300) || "Unknown error"}`);
-    }
-  });
-}
-
 
 // Handle the search phrase after the button prompt.
 bot.on("text", async (ctx, next) => {
@@ -650,6 +446,47 @@ bot.on("text", async (ctx, next) => {
     BULK_QTY_MENU
   );
   return;
+});
+
+// Amount chosen → search, process, and post immediately. No confirmation
+// step: this fires the job as soon as a quantity button is tapped.
+bot.action(/^qty:(\d+|all)$/, async ctx => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  const bulk = pendingBulkSearches.get(chatId);
+  const search = pendingSearches.get(chatId);
+
+  // Bulk mode takes priority, matching the text-handler order above.
+  const isBulk = bulk?.step === "quantity";
+  const isSearch = !isBulk && search && (typeof search === "object" ? search.step === "quantity" : true);
+
+  if (!isBulk && !isSearch) {
+    return ctx.answerCbQuery("Start a search first", { show_alert: true });
+  }
+
+  const query = isBulk ? bulk.query : search.query;
+  const raw = ctx.match[1];
+  const limit = raw === "all" ? 0 : Number(raw);
+
+  if (isBulk) pendingBulkSearches.delete(chatId);
+  else pendingSearches.delete(chatId);
+
+  await ctx.answerCbQuery(raw === "all" ? "Posting all results…" : `Posting ${limit}…`);
+  const statusLabel = raw === "all" ? "all available results" : `${limit} image(s)`;
+  await ctx.reply(`⏳ Searching Pinterest for: ${query}\n🖼️ Amount: ${statusLabel}\n\nProcessing and posting directly to the channel…`);
+
+  try {
+    const { runSearchPostJob } = await import("../worker.js");
+    const result = await runSearchPostJob(query, null, limit);
+    await ctx.reply(
+      `✅ Done\n\n🔎 Search: ${result.query}\n📌 Found: ${result.found}\n🖼️ Posted: ${result.posted}\n\nCheck ${config.telegram.channelId}.`,
+      MAIN_MENU
+    );
+  } catch (error) {
+    logger.error({ error: error?.message, query }, "Search & post job failed");
+    await ctx.reply(`❌ Failed: ${error?.message?.slice(0, 300) || "Unknown error"}`);
+  }
 });
 
 // ── Task controls ──────────────────────────────────────────────
