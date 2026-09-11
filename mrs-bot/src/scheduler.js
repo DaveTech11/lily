@@ -1,7 +1,25 @@
 import cron from "node-cron";
 import { config } from "./config.js";
 import { logger } from "./utils/logger.js";
-import { runHourlyJob } from "./worker.js";
+import { runHourlyJob, runScheduledPostJob } from "./worker.js";
+import { getDueScheduledPosts, markScheduledPostDone, markScheduledPostPending, markScheduledPostRunning } from "./database/database.js";
+
+async function runDueScheduledPosts() {
+  const due = getDueScheduledPosts();
+  for (const job of due) {
+    const claimed = markScheduledPostRunning(job.id);
+    if (!claimed.changes) continue;
+    try {
+      await runScheduledPostJob(job);
+      markScheduledPostDone(job.id);
+      logger.info({ id: job.id, query: job.query, amount: job.amount }, "Persistent scheduled post completed");
+    } catch (error) {
+      markScheduledPostPending(job.id);
+      logger.warn({ id: job.id, error: error?.message }, "Persistent scheduled post kept pending for retry");
+      break;
+    }
+  }
+}
 
 function cronFromSeconds(seconds) {
   // node-cron is minute-oriented. For the requested hourly default this is exact.
@@ -29,6 +47,13 @@ export function startScheduler() {
     await runHourlyJob();
   });
 
+  const nextPostTask = cron.schedule("* * * * *", async () => {
+    await runDueScheduledPosts();
+  });
+
+  // Catch jobs that became due while Render was offline/restarting.
+  void runDueScheduledPosts();
+
   logger.info({
     expression,
     intervalSeconds: config.schedule.intervalSeconds
@@ -38,5 +63,10 @@ export function startScheduler() {
     void runHourlyJob();
   }
 
-  return task;
+  return {
+    stop() {
+      task.stop();
+      nextPostTask.stop();
+    }
+  };
 }
