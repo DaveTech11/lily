@@ -38,20 +38,6 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_posted_images_pin_id
     ON posted_images(pinterest_pin_id);
-
-  CREATE TABLE IF NOT EXISTS scheduled_posts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
-    category TEXT NOT NULL,
-    query TEXT NOT NULL,
-    amount INTEGER NOT NULL,
-    run_at TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_scheduled_posts_due
-    ON scheduled_posts(status, run_at);
 `);
 
 const getStateStmt = db.prepare(
@@ -140,33 +126,4 @@ export function closeDatabase() {
   } catch {
     // Database may already be closed during shutdown.
   }
-}
-
-
-export function createScheduledPost({ userId, category, query, amount, runAt }) {
-  const result = db.prepare(`
-    INSERT INTO scheduled_posts (user_id, category, query, amount, run_at, status)
-    VALUES (@userId, @category, @query, @amount, @runAt, 'pending')
-  `).run({ userId: String(userId), category: String(category), query: String(query), amount: Number(amount), runAt: String(runAt) });
-  return Number(result.lastInsertRowid);
-}
-
-export function getNextScheduledPost() {
-  return db.prepare(`SELECT * FROM scheduled_posts WHERE status = 'pending' ORDER BY run_at ASC, id ASC LIMIT 1`).get() || null;
-}
-
-export function getDueScheduledPosts(nowIso = new Date().toISOString()) {
-  return db.prepare(`SELECT * FROM scheduled_posts WHERE status = 'pending' AND run_at <= ? ORDER BY run_at ASC, id ASC`).all(nowIso);
-}
-
-export function markScheduledPostRunning(id) {
-  return db.prepare(`UPDATE scheduled_posts SET status = 'running' WHERE id = ? AND status = 'pending'`).run(id);
-}
-
-export function markScheduledPostDone(id) {
-  return db.prepare(`UPDATE scheduled_posts SET status = 'done' WHERE id = ?`).run(id);
-}
-
-export function markScheduledPostPending(id) {
-  return db.prepare(`UPDATE scheduled_posts SET status = 'pending' WHERE id = ?`).run(id);
 }

@@ -45,8 +45,8 @@ export const config = {
   content: {
     imagesPerPost: Math.min(Math.max(intEnv("IMAGES_PER_POST", 1), 1), 10),
     searchResultsPerQuery: Math.min(Math.max(intEnv("SEARCH_RESULTS_PER_QUERY", 20), 1), 50),
-    minWidth: intEnv("MIN_IMAGE_WIDTH", 600),
-    minHeight: intEnv("MIN_IMAGE_HEIGHT", 600),
+    minWidth: intEnv("MIN_IMAGE_WIDTH", 300),
+    minHeight: intEnv("MIN_IMAGE_HEIGHT", 300),
     maxDownloadBytes: intEnv("MAX_DOWNLOAD_BYTES", 15_000_000),
     maxTelegramBytes: intEnv("MAX_TELEGRAM_IMAGE_BYTES", 9_500_000),
     maxRetries: Math.min(Math.max(intEnv("MAX_RETRIES", 3), 1), 8),

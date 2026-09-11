@@ -201,10 +201,9 @@ export async function runScheduledPostJob({ category, query, amount }) {
     if (!items.length) return { query, found: 0, posted: 0 };
 
     const candidates = filterCandidates(items, category || "scheduled");
-    const selected = candidates.slice(0, count);
     const prepared = [];
 
-    for (const candidate of selected) {
+    for (const candidate of candidates) {
       await waitIfPaused();
       const item = await prepareCandidate(candidate, category || "scheduled", query);
       if (item) prepared.push(item);
@@ -239,7 +238,7 @@ export async function runHourlyJob() {
     }
 
     const hourlyCount = 10;
-    const selected = selectDiverse(candidates, hourlyCount);
+    const selected = selectDiverse(candidates, Math.min(candidates.length, candidates.length));
     const prepared = [];
 
     for (const candidate of selected) {
@@ -301,14 +300,25 @@ export async function runSearchPostJob(exactQuery, onProgress = null, bulkLimit 
     if (!candidates.length) return { query, found: items.length, accepted: 0, posted: 0 };
 
     const limit = Number.isFinite(Number(bulkLimit)) && Number(bulkLimit) > 0 ? Number(bulkLimit) : 0;
-    const candidatesToPrepare = limit ? candidates.slice(0, limit) : candidates;
+    const target = limit || candidates.length;
 
     const prepared = [];
-    for (let i = 0; i < candidatesToPrepare.length; i++) {
+    let attempted = 0;
+    for (const candidate of candidates) {
+      if (prepared.length >= target) break;
       await waitIfPaused();
-      const item = await prepareCandidate(candidatesToPrepare[i], "manual-search", query);
+      attempted++;
+      const item = await prepareCandidate(candidate, "manual-search", query);
       if (item) prepared.push(item);
-      if (onProgress) await onProgress({ phase: "preparing", current: i + 1, total: candidatesToPrepare.length });
+      if (onProgress) {
+        await onProgress({
+          phase: "preparing",
+          current: attempted,
+          total: candidates.length,
+          prepared: prepared.length,
+          target
+        });
+      }
     }
 
     await waitIfPaused();
@@ -327,14 +337,14 @@ export async function runSearchPostJob(exactQuery, onProgress = null, bulkLimit 
         else left++;
       }
 
-      logger.info({ query, found: items.length, accepted: candidatesToPrepare.length, prepared: prepared.length, posted, left, elapsedMs: Date.now() - startedAt }, "Manual search confirmation flow completed");
-      return { query, found: items.length, accepted: candidatesToPrepare.length, prepared: prepared.length, posted, left };
+      logger.info({ query, found: items.length, accepted: candidates.length, attempted, prepared: prepared.length, posted, left, elapsedMs: Date.now() - startedAt }, "Manual search confirmation flow completed");
+      return { query, found: items.length, accepted: candidates.length, attempted, prepared: prepared.length, posted, left };
     }
 
     const posted = await publishPrepared(prepared, "manual-search", query);
 
-    logger.info({ query, found: items.length, accepted: candidatesToPrepare.length, prepared: prepared.length, posted, elapsedMs: Date.now() - startedAt }, "Manual search post completed");
-    return { query, found: items.length, accepted: candidatesToPrepare.length, prepared: prepared.length, posted };
+    logger.info({ query, found: items.length, accepted: candidates.length, attempted, prepared: prepared.length, posted, elapsedMs: Date.now() - startedAt }, "Manual search post completed");
+    return { query, found: items.length, accepted: candidates.length, attempted, prepared: prepared.length, posted };
   } finally {
     finishTask();
   }

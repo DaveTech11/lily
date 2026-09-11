@@ -40,7 +40,7 @@ export async function downloadImage(url) {
   return withRetry(async () => {
     const response = await axios.get(url, {
       responseType: "arraybuffer",
-      timeout: 25000,
+      timeout: 15000,
       maxContentLength: config.content.maxDownloadBytes,
       maxBodyLength: config.content.maxDownloadBytes,
       validateStatus: s => s >= 200 && s < 300
@@ -68,7 +68,7 @@ export async function downloadImage(url) {
       contentType
     };
   }, {
-    retries: config.content.maxRetries,
+    retries: Math.min(config.content.maxRetries, 2),
     shouldRetry: error => !error.response || error.response.status >= 500 || error.code === "ECONNABORTED"
   });
 }
