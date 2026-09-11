@@ -318,7 +318,7 @@ export async function runHourlyJob() {
   }
 }
 
-export async function runSearchPostJob(exactQuery, onProgress = null, bulkLimit = 0) {
+export async function runSearchPostJob(exactQuery, onProgress = null, bulkLimit = 0, onConfirm = null) {
   const query = String(exactQuery || "").trim();
   if (!query) throw new Error("Search word cannot be empty");
 
@@ -348,7 +348,24 @@ export async function runSearchPostJob(exactQuery, onProgress = null, bulkLimit 
 
     await waitIfPaused();
 
-    // Post directly. The requested amount is preserved by `target` above.
+    // When a confirmation callback is supplied, each prepared image is sent
+    // to the requesting user's DM. Tapping Send posts it immediately; Leave
+    // discards it. Scheduled jobs do not use this path.
+    if (typeof onConfirm === "function") {
+      let posted = 0;
+      let left = 0;
+
+      for (const item of prepared) {
+        await waitIfPaused();
+        const approved = await onConfirm(item);
+        if (approved) posted++;
+        else left++;
+      }
+
+      logger.info({ query, found: items.length, accepted: candidates.length, prepared: prepared.length, posted, left, elapsedMs: Date.now() - startedAt }, "Manual search confirmation flow completed");
+      return { query, found: items.length, accepted: candidates.length, prepared: prepared.length, posted, left };
+    }
+
     const posted = await publishPrepared(prepared, "manual-search", query);
 
     logger.info({ query, found: items.length, accepted: candidates.length, prepared: prepared.length, posted, elapsedMs: Date.now() - startedAt }, "Manual search post completed");

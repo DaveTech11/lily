@@ -87,9 +87,9 @@ async function sendSingle(item) {
   return telegramRequest("sendPhoto", form);
 }
 
-async function sendAlbum(items, chatId = config.telegram.channelId) {
+async function sendAlbum(items) {
   const form = new FormData();
-  form.append("chat_id", String(chatId));
+  form.append("chat_id", String(config.telegram.channelId));
 
   const media = items.map((item, index) => ({
     type: "photo",
@@ -298,7 +298,219 @@ const pendingSearches = new Map();
 const SEARCH_TIMEOUT_MS = 5 * 60 * 1000;
 const pendingBulkSearches = new Map();
 
-// Search results are posted directly after the user selects the amount.
+// Search-result confirmations. Each prepared image is sent to the requesting
+// user's DM first. It is posted to the channel only after they tap Send.
+const pendingConfirmations = new Map();
+let confirmationSequence = 0;
+
+function confirmationKeyboard(id) {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "📤 Send", callback_data: `confirm_send:${id}`, style: "success" },
+          { text: "🗑️ Leave", callback_data: `confirm_leave:${id}`, style: "primary" }
+        ]
+      ]
+    }
+  };
+}
+
+async function confirmAndPostToChannel(ctx, item) {
+  const chatId = ctx.chat?.id;
+  if (!chatId || ctx.chat?.type !== "private") return false;
+
+  const id = `${String(chatId).slice(-12)}_${Date.now()}_${++confirmationSequence}`;
+
+  return new Promise(async (resolve) => {
+    pendingConfirmations.set(id, {
+      id,
+      chatId: String(chatId),
+      item,
+      resolve,
+      createdAt: Date.now(),
+      handled: false
+    });
+
+    try {
+      await ctx.telegram.sendPhoto(chatId, { source: item.filePath }, {
+        caption: item.caption || `🔎 Search: ${item.query || "—"}\n\nDo you want to post this image to the channel?`,
+        ...confirmationKeyboard(id)
+      });
+    } catch (error) {
+      pendingConfirmations.delete(id);
+      await cleanupFiles(item.filePath, item.rawPath);
+      logger.warn({ error: error?.message, id }, "Could not send search image for confirmation");
+      resolve(false);
+    }
+  });
+}
+
+async function handleConfirmation(ctx, action) {
+  const id = String(ctx.match?.[1] || "");
+  const pending = pendingConfirmations.get(id);
+
+  if (!pending) {
+    await ctx.answerCbQuery("This confirmation is no longer active", { show_alert: true });
+    return;
+  }
+
+  if (String(ctx.from?.id) !== pending.chatId) {
+    await ctx.answerCbQuery("This confirmation belongs to another user", { show_alert: true });
+    return;
+  }
+
+  if (pending.handled) {
+    await ctx.answerCbQuery("Already handled");
+    return;
+  }
+
+  pending.handled = true;
+  pendingConfirmations.delete(id);
+
+  if (action === "leave") {
+    await ctx.answerCbQuery("Image left");
+    try {
+      await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+    } catch {}
+    await cleanupFiles(pending.item.filePath, pending.item.rawPath);
+    await ctx.reply("🗑️ Left. This image was not posted to the channel.");
+    pending.resolve(false);
+    return;
+  }
+
+  try {
+    await ctx.answerCbQuery("Posting to channel…");
+    const result = await publish([pending.item]);
+    const message = Array.isArray(result) ? result[0] : result;
+    recordPost({
+      pinterestPinId: String(
+        pending.item.pin?.id ||
+        pending.item.pin?.pin_id ||
+        pending.item.pin?.pinId ||
+        pending.item.pin?.pin_url ||
+        pending.item.pin?.url ||
+        `manual-${pending.item.imageHash}`
+      ),
+      imageHash: pending.item.imageHash,
+      imageUrl: pending.item.imageUrl,
+      sourceUrl: pending.item.sourceUrl,
+      category: "manual-search",
+      query: pending.item.query,
+      caption: pending.item.caption,
+      telegramMessageId: message?.message_id ? String(message.message_id) : null,
+      status: "posted"
+    });
+    await cleanupFiles(pending.item.filePath, pending.item.rawPath);
+    try {
+      await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+    } catch {}
+    await ctx.reply("✅ Sent! The image has been posted to the channel.");
+    pending.resolve(true);
+  } catch (error) {
+    logger.warn({ error: error?.message, id }, "Confirmed image failed to post");
+    await cleanupFiles(pending.item.filePath, pending.item.rawPath);
+    await ctx.reply(`❌ Could not post this image: ${error?.message?.slice(0, 250) || "Unknown error"}`);
+    pending.resolve(false);
+  }
+}
+
+bot.action(/^confirm_send:(.+)$/, (ctx) => handleConfirmation(ctx, "send"));
+bot.action(/^confirm_leave:(.+)$/, (ctx) => handleConfirmation(ctx, "leave"));
+
+async function askForSearch(ctx) {
+  const chatId = ctx.chat?.id;
+  if (!chatId || ctx.chat?.type !== "private") return;
+
+  pendingSearches.set(chatId, Date.now());
+  await ctx.reply(
+    "🔎 Send the exact search word or phrase you want me to search on Pinterest.\n\nExample: pink wallpapers\n\nI will use exactly what you send and post every valid result I can retrieve, with captions.",
+    { reply_markup: { force_reply: true, selective: true } }
+  );
+}
+
+bot.action("search_postnow", async (ctx) => {
+  await ctx.answerCbQuery("Send your search word");
+  await askForSearch(ctx);
+});
+
+async function askForBulkSearch(ctx) {
+  const chatId = ctx.chat?.id;
+  if (!chatId || ctx.chat?.type !== "private") return;
+
+  pendingBulkSearches.set(chatId, { step: "query", started: Date.now() });
+  await ctx.reply(
+    "📦 Bulk Search & Post\n\nSend the exact Pinterest search word or phrase. I will search exactly what you send, then ask how many results you want posted.\n\nExample: anime wallpaper",
+    { reply_markup: { force_reply: true, selective: true } }
+  );
+}
+
+bot.action("bulk_search_post", async (ctx) => {
+  await ctx.answerCbQuery("Send your search word");
+  await askForBulkSearch(ctx);
+});
+
+const BULK_QTY_MENU = {
+  reply_markup: {
+    inline_keyboard: [
+      [{ text: "10 images", callback_data: "bulk_qty_10", style: "success" }, { text: "25 images", callback_data: "bulk_qty_25", style: "success" }],
+      [{ text: "50 images", callback_data: "bulk_qty_50", style: "success" }, { text: "100 images", callback_data: "bulk_qty_100", style: "success" }],
+      [{ text: "♾️ All available", callback_data: "bulk_qty_all", style: "success" }]
+    ]
+  }
+};
+
+for (const [key, qty] of [["bulk_qty_10",10],["bulk_qty_25",25],["bulk_qty_50",50],["bulk_qty_100",100],["bulk_qty_all",0]]) {
+  bot.action(key, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const bulk = pendingBulkSearches.get(chatId);
+    const normal = pendingSearches.get(chatId);
+    const pending = bulk?.step === "quantity" ? bulk : (normal?.step === "quantity" ? normal : null);
+    const isBulk = !!(bulk?.step === "quantity");
+
+    if (!pending) {
+      await ctx.answerCbQuery("Start a search first");
+      return;
+    }
+
+    if (isBulk) pendingBulkSearches.delete(chatId);
+    else pendingSearches.delete(chatId);
+
+    if (Date.now() - pending.started > SEARCH_TIMEOUT_MS) {
+      await ctx.answerCbQuery("Request expired");
+      await ctx.reply("⌛ That search request expired. Start the search again and try again.");
+      return;
+    }
+
+    await ctx.answerCbQuery(qty ? `Posting ${qty} images` : "Posting all available");
+    await ctx.reply(`${isBulk ? "📦 Bulk search started" : "🔎 Search started"}
+
+🔎 Exact query: ${pending.query}
+🖼️ Amount: ${qty || "all available"}
+⏳ Searching Pinterest and preparing your selected images...`);
+
+    try {
+      const { runSearchPostJob } = await import("../worker.js");
+      const result = await runSearchPostJob(
+        pending.query,
+        null,
+        qty,
+        async (item) => confirmAndPostToChannel(ctx, item)
+      );
+      await ctx.reply(`✅ ${isBulk ? "Bulk post" : "Search post"} complete!
+
+🔎 Query: ${result.query}
+📌 Results found: ${result.found}
+🖼️ Posted: ${result.posted}
+⏭️ Skipped/failed: ${Math.max(0, (result.accepted || 0) - result.posted)}
+📢 Channel: ${config.telegram.channelId}`);
+    } catch (error) {
+      logger.error({ error: error?.stack || error?.message, query: pending.query, qty }, `${isBulk ? "Bulk Search & Post" : "Search & Post"} failed`);
+      await ctx.reply(`❌ ${isBulk ? "Bulk Search & Post" : "Search & Post"} failed: ${error?.message?.slice(0, 300) || "Unknown error"}`);
+    }
+  });
+}
+
 
 // Handle the search phrase after the button prompt.
 bot.on("text", async (ctx, next) => {
