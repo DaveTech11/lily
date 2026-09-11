@@ -436,6 +436,55 @@ async function handleConfirmation(ctx, action) {
 bot.action(/^confirm_album_send:(.+)$/, (ctx) => handleConfirmation(ctx, "send"));
 bot.action(/^confirm_album_leave:(.+)$/, (ctx) => handleConfirmation(ctx, "leave"));
 
+// Fallback commands for when Telegram inline buttons are unavailable or do not respond.
+// /send posts the latest pending search album for the requesting user.
+// /leave discards the latest pending search album.
+function getLatestPendingConfirmation(chatId) {
+  const key = String(chatId || "");
+  let latest = null;
+  for (const [id, pending] of pendingConfirmations.entries()) {
+    if (pending.chatId === key && (!latest || pending.createdAt > latest.createdAt)) {
+      latest = { id, ...pending };
+    }
+  }
+  return latest;
+}
+
+bot.command("send", async (ctx) => {
+  if (ctx.chat?.type !== "private") return;
+  if (!canUseButtons(ctx)) {
+    await ctx.reply("⛔ You are not authorized to use this command.");
+    return;
+  }
+
+  const pending = getLatestPendingConfirmation(ctx.chat.id);
+  if (!pending) {
+    await ctx.reply("ℹ️ No pending album is waiting to be sent. Run a search first.");
+    return;
+  }
+
+  // Reuse the exact same confirmation handler as the Send button.
+  ctx.match = [pending.id, pending.id];
+  await handleConfirmation(ctx, "send");
+});
+
+bot.command("leave", async (ctx) => {
+  if (ctx.chat?.type !== "private") return;
+  if (!canUseButtons(ctx)) {
+    await ctx.reply("⛔ You are not authorized to use this command.");
+    return;
+  }
+
+  const pending = getLatestPendingConfirmation(ctx.chat.id);
+  if (!pending) {
+    await ctx.reply("ℹ️ No pending album is waiting. Run a search first.");
+    return;
+  }
+
+  ctx.match = [pending.id, pending.id];
+  await handleConfirmation(ctx, "leave");
+});
+
 function createSearchProgressReporter(ctx) {
   let lastMessageId = null;
   let lastText = "";
