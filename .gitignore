@@ -6,3 +6,5 @@
 auth_info/
 sessions/
 auth/
+
+node_modules/

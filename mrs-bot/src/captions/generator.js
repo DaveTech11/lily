@@ -77,7 +77,24 @@ function moodFor(classification) {
   return "default";
 }
 
-export function generateCaption({ category, classification, pin }) {
+export function generateCaption({ category, classification, pin, query }) {
+  const search = String(query || "").trim().toLowerCase();
+  const words = search.split(/\s+/).filter(Boolean);
+  const prettyQuery = search.replace(/\s+/g, " ").trim();
+
+  // Make the caption reflect what the user actually searched for.
+  // This is intentionally based on the query itself, not a generic category.
+  if (prettyQuery) {
+    const tag = words.slice(0, 8).map(w => `#${w.replace(/[^a-z0-9_]/gi, "")}`).filter(Boolean).join(" ");
+    const queryCaptions = [
+      `found from your search: “${prettyQuery}”`,
+      `your search mood — ${prettyQuery}`,
+      `picked for “${prettyQuery}”`,
+      `searching the mood of “${prettyQuery}”`,
+      `a little ${prettyQuery} energy for your feed`
+    ];
+    return `${pick(queryCaptions)} ${pick(SYMBOLS)}${tag ? `\n${tag}` : ""}`;
+  }
   const label = moodFor(classification);
 
   // Movie titles are taken only from metadata returned by the API; no OCR or

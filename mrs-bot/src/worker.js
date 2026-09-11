@@ -106,7 +106,8 @@ async function prepareCandidate(candidate, category, query) {
       caption: generateCaption({
         category,
         classification: candidate.classification,
-        pin: candidate.pin
+        pin: candidate.pin,
+        query
       })
     };
   } catch (error) {
@@ -190,6 +191,34 @@ async function publishPrepared(prepared, category, query) {
   return posted;
 }
 
+export async function runScheduledPostJob({ category, query, amount }) {
+  const count = Math.min(Math.max(Number(amount) || 1, 1), 100);
+  const startedAt = Date.now();
+  beginTask("scheduled-next-post", query);
+
+  try {
+    const items = await searchPins(query);
+    if (!items.length) return { query, found: 0, posted: 0 };
+
+    const candidates = filterCandidates(items, category || "scheduled");
+    const selected = candidates.slice(0, count);
+    const prepared = [];
+
+    for (const candidate of selected) {
+      await waitIfPaused();
+      const item = await prepareCandidate(candidate, category || "scheduled", query);
+      if (item) prepared.push(item);
+      if (prepared.length >= count) break;
+    }
+
+    const posted = await publishPrepared(prepared, category || "scheduled", query);
+    logger.info({ category, query, requested: count, found: items.length, posted, elapsedMs: Date.now() - startedAt }, "Scheduled next post completed");
+    return { query, found: items.length, posted, requested: count };
+  } finally {
+    finishTask();
+  }
+}
+
 export async function runHourlyJob() {
   const startedAt = Date.now();
 
@@ -209,14 +238,15 @@ export async function runHourlyJob() {
       return 0;
     }
 
-    const selected = selectDiverse(candidates, config.content.imagesPerPost);
+    const hourlyCount = 10;
+    const selected = selectDiverse(candidates, hourlyCount);
     const prepared = [];
 
     for (const candidate of selected) {
       await waitIfPaused();
       const item = await prepareCandidate(candidate, category, query);
       if (item) prepared.push(item);
-      if (prepared.length >= config.content.imagesPerPost) break;
+      if (prepared.length >= hourlyCount) break;
     }
 
     if (!prepared.length) {
@@ -225,10 +255,10 @@ export async function runHourlyJob() {
     }
 
     await waitIfPaused();
-    const result = await publish(prepared);
+    const result = await publish(prepared.slice(0, 10));
     const messages = Array.isArray(result) ? result : [result];
 
-    for (let i = 0; i < prepared.length; i++) {
+    for (let i = 0; i < Math.min(prepared.length, 10); i++) {
       recordPost({
         pinterestPinId: String(prepared[i].pin.id),
         imageHash: prepared[i].imageHash,
@@ -242,7 +272,7 @@ export async function runHourlyJob() {
       });
     }
 
-    await cleanupFiles(...prepared.flatMap(item => [item.filePath, item.rawPath]));
+    await cleanupFiles(...prepared.slice(0, 10).flatMap(item => [item.filePath, item.rawPath]));
     logger.info({ category, query, count: prepared.length, elapsedMs: Date.now() - startedAt }, "Hourly post completed");
     return prepared.length;
   } catch (error) {
@@ -253,7 +283,7 @@ export async function runHourlyJob() {
   }
 }
 
-export async function runSearchPostJob(exactQuery, onProgress = null, bulkLimit = 0) {
+export async function runSearchPostJob(exactQuery, onProgress = null, bulkLimit = 0, onConfirm = null) {
   const query = String(exactQuery || "").trim();
   if (!query) throw new Error("Search word cannot be empty");
 
@@ -282,6 +312,25 @@ export async function runSearchPostJob(exactQuery, onProgress = null, bulkLimit 
     }
 
     await waitIfPaused();
+
+    // When a confirmation callback is supplied, each prepared image is sent
+    // to the requesting user's DM. Tapping Send posts it immediately; Leave
+    // discards it. Scheduled jobs do not use this path.
+    if (typeof onConfirm === "function") {
+      let posted = 0;
+      let left = 0;
+
+      for (const item of prepared) {
+        await waitIfPaused();
+        const approved = await onConfirm(item);
+        if (approved) posted++;
+        else left++;
+      }
+
+      logger.info({ query, found: items.length, accepted: candidatesToPrepare.length, prepared: prepared.length, posted, left, elapsedMs: Date.now() - startedAt }, "Manual search confirmation flow completed");
+      return { query, found: items.length, accepted: candidatesToPrepare.length, prepared: prepared.length, posted, left };
+    }
+
     const posted = await publishPrepared(prepared, "manual-search", query);
 
     logger.info({ query, found: items.length, accepted: candidatesToPrepare.length, prepared: prepared.length, posted, elapsedMs: Date.now() - startedAt }, "Manual search post completed");
