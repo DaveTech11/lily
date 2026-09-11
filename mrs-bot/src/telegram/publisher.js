@@ -87,9 +87,9 @@ async function sendSingle(item) {
   return telegramRequest("sendPhoto", form);
 }
 
-async function sendAlbum(items) {
+async function sendAlbum(items, chatId = config.telegram.channelId) {
   const form = new FormData();
-  form.append("chat_id", String(config.telegram.channelId));
+  form.append("chat_id", String(chatId));
 
   const media = items.map((item, index) => ({
     type: "photo",
@@ -298,27 +298,26 @@ const pendingSearches = new Map();
 const SEARCH_TIMEOUT_MS = 5 * 60 * 1000;
 const pendingBulkSearches = new Map();
 
-// Search-result confirmations. Each prepared image is sent to the requesting
-// user's DM first. It is posted to the channel only after they tap Send.
+// Search-result confirmations. Search results are shown to the requesting
+// user as Telegram albums (max 10 images per album). The whole album is
+// posted to the channel only after the user taps Send.
 const pendingConfirmations = new Map();
 let confirmationSequence = 0;
 
 function confirmationKeyboard(id) {
   return {
     reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "📤 Send", callback_data: `confirm_send:${id}`, style: "success" },
-          { text: "🗑️ Leave", callback_data: `confirm_leave:${id}`, style: "primary" }
-        ]
-      ]
+      inline_keyboard: [[
+        { text: "📤 Send", callback_data: `confirm_album_send:${id}`, style: "success" },
+        { text: "🗑️ Leave", callback_data: `confirm_album_leave:${id}`, style: "primary" }
+      ]]
     }
   };
 }
 
-async function confirmAndPostToChannel(ctx, item) {
+async function confirmAndPostAlbum(ctx, items) {
   const chatId = ctx.chat?.id;
-  if (!chatId || ctx.chat?.type !== "private") return false;
+  if (!chatId || ctx.chat?.type !== "private" || !Array.isArray(items) || !items.length) return false;
 
   const id = `${String(chatId).slice(-12)}_${Date.now()}_${++confirmationSequence}`;
 
@@ -326,24 +325,35 @@ async function confirmAndPostToChannel(ctx, item) {
     pendingConfirmations.set(id, {
       id,
       chatId: String(chatId),
-      item,
+      items,
       resolve,
       createdAt: Date.now(),
       handled: false
     });
 
     try {
-      await ctx.telegram.sendPhoto(chatId, { source: item.filePath }, {
-        caption: item.caption || `🔎 Search: ${item.query || "—"}\n\nDo you want to post this image to the channel?`,
-        ...confirmationKeyboard(id)
-      });
+      // Send exactly one album (or one final partial album) to the user's DM.
+      await sendAlbum(items, chatId);
+
+      await ctx.reply(
+        `📦 ${items.length} image${items.length === 1 ? "" : "s"} ready\n\n` +
+        `🔎 ${items[0]?.query || "Pinterest search"}\n\n` +
+        `Do you want to post this album to the channel?`,
+        confirmationKeyboard(id)
+      );
     } catch (error) {
       pendingConfirmations.delete(id);
-      await cleanupFiles(item.filePath, item.rawPath);
-      logger.warn({ error: error?.message, id }, "Could not send search image for confirmation");
+      await cleanupConfirmationItems(items);
+      logger.warn({ error: error?.message, id, count: items.length }, "Could not send search album for confirmation");
       resolve(false);
     }
   });
+}
+
+async function cleanupConfirmationItems(items = []) {
+  for (const item of items) {
+    await cleanupFiles(item?.filePath, item?.rawPath);
+  }
 }
 
 async function handleConfirmation(ctx, action) {
@@ -369,54 +379,90 @@ async function handleConfirmation(ctx, action) {
   pendingConfirmations.delete(id);
 
   if (action === "leave") {
-    await ctx.answerCbQuery("Image left");
+    await ctx.answerCbQuery("Album left");
     try {
       await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
     } catch {}
-    await cleanupFiles(pending.item.filePath, pending.item.rawPath);
-    await ctx.reply("🗑️ Left. This image was not posted to the channel.");
+    await cleanupConfirmationItems(pending.items);
+    await ctx.reply(`🗑️ Left. ${pending.items.length} image${pending.items.length === 1 ? "" : "s"} were not posted.`);
     pending.resolve(false);
     return;
   }
 
   try {
-    await ctx.answerCbQuery("Posting to channel…");
-    const result = await publish([pending.item]);
-    const message = Array.isArray(result) ? result[0] : result;
-    recordPost({
-      pinterestPinId: String(
-        pending.item.pin?.id ||
-        pending.item.pin?.pin_id ||
-        pending.item.pin?.pinId ||
-        pending.item.pin?.pin_url ||
-        pending.item.pin?.url ||
-        `manual-${pending.item.imageHash}`
-      ),
-      imageHash: pending.item.imageHash,
-      imageUrl: pending.item.imageUrl,
-      sourceUrl: pending.item.sourceUrl,
-      category: "manual-search",
-      query: pending.item.query,
-      caption: pending.item.caption,
-      telegramMessageId: message?.message_id ? String(message.message_id) : null,
-      status: "posted"
-    });
-    await cleanupFiles(pending.item.filePath, pending.item.rawPath);
+    await ctx.answerCbQuery("Posting album to channel…");
+
+    // publish() sends the entire batch as one Telegram album when <= 10.
+    const result = await publish(pending.items);
+    const telegramResults = Array.isArray(result) ? result : (result ? [result] : []);
+
+    for (let i = 0; i < pending.items.length; i++) {
+      const item = pending.items[i];
+      const telegramMessage = telegramResults[i];
+      recordPost({
+        pinterestPinId: String(
+          item.pin?.id ||
+          item.pin?.pin_id ||
+          item.pin?.pinId ||
+          item.pin?.pin_url ||
+          item.pin?.url ||
+          `manual-${item.imageHash}`
+        ),
+        imageHash: item.imageHash,
+        imageUrl: item.imageUrl,
+        sourceUrl: item.sourceUrl,
+        category: "manual-search",
+        query: item.query,
+        caption: item.caption,
+        telegramMessageId: telegramMessage?.message_id ? String(telegramMessage.message_id) : null,
+        status: "posted"
+      });
+    }
+
+    await cleanupConfirmationItems(pending.items);
     try {
       await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
     } catch {}
-    await ctx.reply("✅ Sent! The image has been posted to the channel.");
+    await ctx.reply(`✅ Sent! The ${pending.items.length}-image album has been posted to the channel.`);
     pending.resolve(true);
   } catch (error) {
-    logger.warn({ error: error?.message, id }, "Confirmed image failed to post");
-    await cleanupFiles(pending.item.filePath, pending.item.rawPath);
-    await ctx.reply(`❌ Could not post this image: ${error?.message?.slice(0, 250) || "Unknown error"}`);
+    logger.warn({ error: error?.message, id, count: pending.items.length }, "Confirmed album failed to post");
+    await cleanupConfirmationItems(pending.items);
+    await ctx.reply(`❌ Could not post this album: ${error?.message?.slice(0, 250) || "Unknown error"}`);
     pending.resolve(false);
   }
 }
 
-bot.action(/^confirm_send:(.+)$/, (ctx) => handleConfirmation(ctx, "send"));
-bot.action(/^confirm_leave:(.+)$/, (ctx) => handleConfirmation(ctx, "leave"));
+bot.action(/^confirm_album_send:(.+)$/, (ctx) => handleConfirmation(ctx, "send"));
+bot.action(/^confirm_album_leave:(.+)$/, (ctx) => handleConfirmation(ctx, "leave"));
+
+function createSearchProgressReporter(ctx) {
+  let lastMessageId = null;
+  let lastText = "";
+  let lastUpdate = 0;
+
+  return async ({ phase, current, total, attempted, available }) => {
+    const label = phase === "prepared" ? "ᴘʀᴇᴘᴀʀᴇᴅ" : "ᴘʀᴏᴄᴇssɪɴɢ";
+    const text =
+      `⏳ ${label} ${Math.min(current, total)}/${total}\n\n` +
+      `🔎 ${ctx?.chat ? "Search" : "Pinterest"}\n` +
+      `📦 Attempted: ${attempted}/${available}`;
+
+    // Avoid hammering Telegram with edits while images are being processed.
+    if (text === lastText || Date.now() - lastUpdate < 700) return;
+    lastText = text;
+    lastUpdate = Date.now();
+
+    try {
+      if (!lastMessageId) {
+        const sent = await ctx.reply(text);
+        lastMessageId = sent.message_id;
+      } else {
+        await ctx.telegram.editMessageText(ctx.chat.id, lastMessageId, undefined, text);
+      }
+    } catch {}
+  };
+}
 
 async function askForSearch(ctx) {
   const chatId = ctx.chat?.id;
@@ -491,11 +537,12 @@ for (const [key, qty] of [["bulk_qty_10",10],["bulk_qty_25",25],["bulk_qty_50",5
 
     try {
       const { runSearchPostJob } = await import("../worker.js");
+      const progress = createSearchProgressReporter(ctx);
       const result = await runSearchPostJob(
         pending.query,
-        null,
+        progress,
         qty,
-        async (item) => confirmAndPostToChannel(ctx, item)
+        async (album) => confirmAndPostAlbum(ctx, album)
       );
       await ctx.reply(`✅ ${isBulk ? "Bulk post" : "Search post"} complete!
 

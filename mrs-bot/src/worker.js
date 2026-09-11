@@ -318,7 +318,7 @@ export async function runHourlyJob() {
   }
 }
 
-export async function runSearchPostJob(exactQuery, onProgress = null, bulkLimit = 0, onConfirm = null) {
+export async function runSearchPostJob(exactQuery, onProgress = null, bulkLimit = 0, onConfirmAlbum = null) {
   const query = String(exactQuery || "").trim();
   if (!query) throw new Error("Search word cannot be empty");
 
@@ -348,21 +348,32 @@ export async function runSearchPostJob(exactQuery, onProgress = null, bulkLimit 
 
     await waitIfPaused();
 
-    // When a confirmation callback is supplied, each prepared image is sent
-    // to the requesting user's DM. Tapping Send posts it immediately; Leave
-    // discards it. Scheduled jobs do not use this path.
-    if (typeof onConfirm === "function") {
+    // Confirmation mode groups search results into Telegram albums of up to
+    // 10 images. The user approves or leaves each album as a whole.
+    if (typeof onConfirmAlbum === "function") {
       let posted = 0;
       let left = 0;
+      const ALBUM_SIZE = 10;
 
-      for (const item of prepared) {
+      for (let start = 0; start < prepared.length; start += ALBUM_SIZE) {
         await waitIfPaused();
-        const approved = await onConfirm(item);
-        if (approved) posted++;
-        else left++;
+        const album = prepared.slice(start, start + ALBUM_SIZE);
+        const approved = await onConfirmAlbum(album);
+        if (approved) posted += album.length;
+        else left += album.length;
       }
 
-      logger.info({ query, found: items.length, accepted: candidates.length, prepared: prepared.length, posted, left, elapsedMs: Date.now() - startedAt }, "Manual search confirmation flow completed");
+      logger.info({
+        query,
+        found: items.length,
+        accepted: candidates.length,
+        prepared: prepared.length,
+        posted,
+        left,
+        albums: Math.ceil(prepared.length / ALBUM_SIZE),
+        elapsedMs: Date.now() - startedAt
+      }, "Manual search album confirmation flow completed");
+
       return { query, found: items.length, accepted: candidates.length, prepared: prepared.length, posted, left };
     }
 
