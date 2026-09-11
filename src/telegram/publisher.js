@@ -491,9 +491,29 @@ for (const [key, qty] of [["bulk_qty_10",10],["bulk_qty_25",25],["bulk_qty_50",5
 
     try {
       const { runSearchPostJob } = await import("../worker.js");
+      const progressMessage = await ctx.reply(
+        `⏳ ᴘʀᴏᴄᴇssɪɴɢ 0/${qty || "available"}\n🔎 ${pending.query}`
+      );
+      let lastProgressAt = 0;
+
       const result = await runSearchPostJob(
         pending.query,
-        null,
+        async ({ prepared = 0, target = qty || 0 }) => {
+          const now = Date.now();
+          if (now - lastProgressAt < 700 && prepared < target) return;
+          lastProgressAt = now;
+          const totalLabel = target || "available";
+          try {
+            await ctx.telegram.editMessageText(
+              ctx.chat.id,
+              progressMessage.message_id,
+              undefined,
+              `⏳ ᴘʀᴏᴄᴇssɪɴɢ ${prepared}/${totalLabel}\n🔎 ${pending.query}`
+            );
+          } catch {
+            // Ignore progress-edit failures and keep the posting task alive.
+          }
+        },
         qty,
         async (item) => confirmAndPostToChannel(ctx, item)
       );

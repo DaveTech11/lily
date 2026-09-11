@@ -40,7 +40,7 @@ export async function downloadImage(url) {
   return withRetry(async () => {
     const response = await axios.get(url, {
       responseType: "arraybuffer",
-      timeout: 10000,
+      timeout: 25000,
       maxContentLength: config.content.maxDownloadBytes,
       maxBodyLength: config.content.maxDownloadBytes,
       validateStatus: s => s >= 200 && s < 300
